@@ -1,0 +1,93 @@
+---
+title: "API Overview"
+description: "Public API surface of megatron.core — imports, key classes, and navigation to each API section."
+---
+
+Megatron-LM exposes a stable public API through the `megatron.core` package. The top-level `__init__.py` re-exports the most commonly used symbols so that a single import gives you access to parallelism state, distributed training utilities, and inference helpers.
+
+<CardGroup cols={2}>
+  <Card title="Models" icon="cube" href="/api/models">
+    GPTModel, BertModel — constructor parameters and usage examples
+  </Card>
+  <Card title="Transformer Building Blocks" icon="layer-group" href="/api/transformer">
+    TransformerConfig, TransformerBlock, attention types
+  </Card>
+  <Card title="Parallelism API" icon="network-wired" href="/api/parallelism">
+    ModelParallelConfig, parallel_state, DistributedDataParallel
+  </Card>
+  <Card title="Optimizers" icon="sliders" href="/api/optimizer">
+    OptimizerConfig, DistributedOptimizer, get_megatron_optimizer
+  </Card>
+  <Card title="Inference API" icon="bolt" href="/api/inference">
+    InferenceParams, SamplingParams, InferenceRequest
+  </Card>
+</CardGroup>
+
+## Top-level exports
+
+Everything listed in `megatron.core.__all__` is part of the stable public surface:
+
+```python
+from megatron.core import (
+    parallel_state,        # model/data parallel group management (alias: mpu)
+    tensor_parallel,       # tensor-parallel layers and mappings
+    DistributedDataParallel,
+    InferenceParams,       # alias for StaticInferenceContext
+    ModelParallelConfig,
+    Timers,
+)
+```
+
+`parallel_state` is also available as the legacy alias `mpu`:
+
+```python
+from megatron.core import mpu
+rank = mpu.get_tensor_model_parallel_rank()
+```
+
+## Quick import reference
+
+| Symbol | Import path | Description |
+|--------|-------------|-------------|
+| `ModelParallelConfig` | `megatron.core` | Base parallelism configuration dataclass |
+| `TransformerConfig` | `megatron.core.transformer.transformer_config` | Full transformer + parallelism config |
+| `GPTModel` | `megatron.core.models.gpt` | Causal language model |
+| `BertModel` | `megatron.core.models.bert` | Masked language / encoder model |
+| `TransformerBlock` | `megatron.core.transformer.transformer_block` | Stack of transformer layers |
+| `parallel_state` | `megatron.core` | Process-group management module |
+| `DistributedDataParallel` | `megatron.core` | DDP wrapper with grad buffers |
+| `DistributedOptimizer` | `megatron.core.optimizer` | Sharded optimizer for large models |
+| `OptimizerConfig` | `megatron.core.optimizer` | Optimizer hyperparameter dataclass |
+| `get_megatron_optimizer` | `megatron.core.optimizer` | Factory that builds the right optimizer |
+| `InferenceParams` | `megatron.core` | KV-cache context (alias for `StaticInferenceContext`) |
+| `SamplingParams` | `megatron.core.inference.sampling_params` | Per-request sampling settings |
+| `InferenceRequest` | `megatron.core.inference.inference_request` | Holds prompt + generation output |
+
+## Package structure
+
+```
+megatron/
+└── core/
+    ├── __init__.py               # public re-exports
+    ├── model_parallel_config.py  # ModelParallelConfig
+    ├── parallel_state.py         # initialize_model_parallel, rank/group getters
+    ├── inference_params.py       # InferenceParams alias
+    ├── timers.py                 # Timers utility
+    ├── distributed/              # DistributedDataParallel, FullyShardedDataParallel
+    ├── tensor_parallel/          # ColumnParallelLinear, RowParallelLinear, …
+    ├── optimizer/                # OptimizerConfig, DistributedOptimizer, get_megatron_optimizer
+    ├── transformer/
+    │   ├── transformer_config.py # TransformerConfig
+    │   └── transformer_block.py  # TransformerBlock
+    ├── models/
+    │   ├── gpt/                  # GPTModel
+    │   └── bert/                 # BertModel
+    └── inference/
+        ├── sampling_params.py    # SamplingParams
+        ├── inference_request.py  # InferenceRequest
+        └── contexts/             # StaticInferenceContext, DynamicInferenceContext
+```
+
+<Note>
+`InferenceParams` is an alias for `StaticInferenceContext` kept for backward compatibility. New code should use `StaticInferenceContext` directly from `megatron.core.inference.contexts`.
+</Note>

@@ -1,0 +1,247 @@
+---
+title: "Models"
+description: "GPTModel and BertModel — constructor parameters, configuration, and usage examples."
+---
+
+Megatron-LM ships two production-grade language model classes under `megatron.core.models`. Both inherit from `LanguageModule` and integrate with pipeline/tensor parallelism via `TransformerConfig`.
+
+## GPTModel
+
+`megatron.core.models.gpt.GPTModel`
+
+A decoder-only causal language model (GPT family). Supports learned-absolute, RoPE, mRoPE, and YaRN positional embeddings; optional multi-token prediction (MTP) heads; and pipeline-parallel pre/post processing stages.
+
+```python
+from megatron.core.models.gpt import GPTModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
+
+config = TransformerConfig(
+    num_layers=24,
+    hidden_size=1024,
+    num_attention_heads=16,
+    use_cpu_initialization=True,
+)
+
+model = GPTModel(
+    config=config,
+    transformer_layer_spec=my_layer_spec,  # ModuleSpec describing layer submodules
+    vocab_size=50257,
+    max_sequence_length=2048,
+    position_embedding_type='rope',
+    rotary_base=10000,
+)
+```
+
+### Constructor parameters
+
+<ParamField path="config" type="TransformerConfig" required>
+  Full model + parallelism configuration. See [TransformerConfig](/api/transformer#transformerconfig).
+</ParamField>
+
+<ParamField path="transformer_layer_spec" type="ModuleSpec" required>
+  Specifies which modules to use for each transformer layer (attention, MLP, norms, etc.). Use `get_gpt_layer_local_spec()` or `get_gpt_layer_with_transformer_engine_spec()` from `megatron.core.models.gpt.gpt_layer_specs`.
+</ParamField>
+
+<ParamField path="vocab_size" type="int" required>
+  Vocabulary size. Sets the shape of the embedding table and output logit projection.
+</ParamField>
+
+<ParamField path="max_sequence_length" type="int" required>
+  Maximum sequence length. Used to allocate the learned-absolute positional embedding table and RoPE buffers.
+</ParamField>
+
+<ParamField path="pre_process" type="bool" default="True">
+  When `True`, this pipeline stage includes the embedding layer. Set to `False` for non-first pipeline stages.
+</ParamField>
+
+<ParamField path="post_process" type="bool" default="True">
+  When `True`, this pipeline stage includes the output (logit) projection layer. Set to `False` for non-last pipeline stages.
+</ParamField>
+
+<ParamField path="fp16_lm_cross_entropy" type="bool" default="False">
+  Compute the cross-entropy loss in fp16 instead of fp32.
+</ParamField>
+
+<ParamField path="parallel_output" type="bool" default="True">
+  Keep logit outputs split across tensor-parallel ranks rather than gathering them. Pass `False` when you need the full vocabulary logits on every rank (e.g. during evaluation).
+</ParamField>
+
+<ParamField path="share_embeddings_and_output_weights" type="bool" default="False">
+  Tie input embedding weights to output logit projection weights. Common in many GPT variants.
+</ParamField>
+
+<ParamField path="position_embedding_type" type="Literal['learned_absolute', 'rope', 'mrope', 'yarn', 'none']" default="'learned_absolute'">
+  Positional embedding strategy:
+  - `learned_absolute` — standard learned absolute position embeddings
+  - `rope` — Rotary Position Embeddings (RoPE)
+  - `mrope` — Multimodal RoPE
+  - `yarn` — YaRN-extended RoPE for long-context models
+  - `none` — no positional embeddings
+</ParamField>
+
+<ParamField path="rotary_percent" type="float" default="1.0">
+  Fraction of the head dimension to apply RoPE to. Ignored unless `position_embedding_type='rope'`.
+</ParamField>
+
+<ParamField path="rotary_base" type="int" default="10000">
+  Base frequency for the RoPE sinusoidal schedule. Ignored unless `position_embedding_type='rope'`.
+</ParamField>
+
+<ParamField path="rope_scaling" type="bool" default="False">
+  Enable linear RoPE frequency scaling.
+</ParamField>
+
+<ParamField path="rope_scaling_factor" type="float" default="8.0">
+  Scaling factor applied when `rope_scaling=True`.
+</ParamField>
+
+<ParamField path="scatter_embedding_sequence_parallel" type="bool" default="True">
+  Scatter embeddings across the sequence-parallel region after the embedding lookup.
+</ParamField>
+
+<ParamField path="seq_len_interpolation_factor" type="Optional[float]" default="None">
+  Linear interpolation scale for RoPE, enabling context extension beyond `max_sequence_length`. Must be `> 1.0` when set.
+</ParamField>
+
+<ParamField path="mtp_block_spec" type="Optional[ModuleSpec]" default="None">
+  Module specification for Multi-Token Prediction (MTP) heads. When provided, the model predicts multiple future tokens simultaneously.
+</ParamField>
+
+<ParamField path="pg_collection" type="Optional[ProcessGroupCollection]" default="None">
+  Explicit process-group collection. When `None`, the global `parallel_state` groups are used.
+</ParamField>
+
+<ParamField path="vp_stage" type="Optional[int]" default="None">
+  Virtual pipeline stage index. Set automatically by the training harness when using interleaved pipeline parallelism.
+</ParamField>
+
+---
+
+## BertModel
+
+`megatron.core.models.bert.BertModel`
+
+A bidirectional encoder model (BERT family). Supports masked language modeling, next-sentence prediction (binary head), and pooled embeddings. Uses full bidirectional attention masks.
+
+```python
+from megatron.core.models.bert import BertModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+config = TransformerConfig(
+    num_layers=12,
+    hidden_size=768,
+    num_attention_heads=12,
+)
+
+model = BertModel(
+    config=config,
+    num_tokentypes=2,               # 2 for NSP (BERT), 0 otherwise
+    transformer_layer_spec=my_layer_spec,
+    vocab_size=30522,
+    max_sequence_length=512,
+    add_binary_head=True,           # include NSP head
+)
+```
+
+### Constructor parameters
+
+<ParamField path="config" type="TransformerConfig" required>
+  Full model + parallelism configuration.
+</ParamField>
+
+<ParamField path="num_tokentypes" type="int" required>
+  Number of token-type embeddings. Set to `2` when `add_binary_head=True` (for sentence A / sentence B distinction in BERT); set to `0` otherwise.
+</ParamField>
+
+<ParamField path="transformer_layer_spec" type="ModuleSpec" required>
+  Module specification for transformer layers.
+</ParamField>
+
+<ParamField path="vocab_size" type="int" required>
+  Vocabulary size.
+</ParamField>
+
+<ParamField path="max_sequence_length" type="int" required>
+  Maximum sequence length for positional embeddings.
+</ParamField>
+
+<ParamField path="pre_process" type="bool" default="True">
+  Include embedding layer (set `False` for non-first pipeline stages).
+</ParamField>
+
+<ParamField path="post_process" type="bool" default="True">
+  Include the output/pooler layer (set `False` for non-last pipeline stages).
+</ParamField>
+
+<ParamField path="fp16_lm_cross_entropy" type="bool" default="False">
+  Compute masked-LM cross-entropy in fp16.
+</ParamField>
+
+<ParamField path="parallel_output" type="bool" default="True">
+  Keep outputs distributed across tensor-parallel ranks.
+</ParamField>
+
+<ParamField path="share_embeddings_and_output_weights" type="bool" default="False">
+  Tie input and output embedding weights.
+</ParamField>
+
+<ParamField path="position_embedding_type" type="Literal['learned_absolute', 'rope']" default="'learned_absolute'">
+  Positional embedding type. BERT typically uses `'learned_absolute'`.
+</ParamField>
+
+<ParamField path="rotary_percent" type="float" default="1.0">
+  RoPE coverage fraction. Ignored unless `position_embedding_type='rope'`.
+</ParamField>
+
+<ParamField path="seq_len_interpolation_factor" type="Optional[float]" default="None">
+  RoPE linear interpolation scale for longer sequences.
+</ParamField>
+
+<ParamField path="add_binary_head" type="bool" default="True">
+  Include the next-sentence prediction (NSP) binary classification head.
+</ParamField>
+
+<ParamField path="return_embeddings" type="bool" default="False">
+  Return pooled embeddings instead of logits. Requires `post_process=True` and `add_binary_head=True`.
+</ParamField>
+
+<ParamField path="vp_stage" type="Optional[int]" default="None">
+  Virtual pipeline stage index.
+</ParamField>
+
+<ParamField path="pg_collection" type="Optional[ProcessGroupCollection]" default="None">
+  Process-group collection override.
+</ParamField>
+
+---
+
+## Common forward-pass pattern
+
+Both models follow the same `forward()` convention used by the pipeline-parallel training loop:
+
+```python
+import torch
+
+# Tokenized input (already on GPU)
+input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device='cuda')
+attention_mask = torch.ones_like(input_ids)
+
+# GPT forward (causal)
+logits = model(
+    input_ids=input_ids,
+    position_ids=None,      # computed automatically when None
+    attention_mask=attention_mask,
+)
+
+# BertModel forward (bidirectional)
+lm_logits, binary_logits, pooled = model(
+    input_ids=input_ids,
+    attention_mask=attention_mask,
+    tokentype_ids=torch.zeros_like(input_ids),
+)
+```
+
+<Tip>
+When using pipeline parallelism, only the first stage (`pre_process=True`) receives `input_ids`. Intermediate stages receive activations from the previous stage. Set `pre_process` and `post_process` to match the rank's pipeline position.
+</Tip>

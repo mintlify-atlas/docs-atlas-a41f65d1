@@ -1,0 +1,283 @@
+---
+title: "Multimodal Training"
+description: "Train vision-language models (VLMs) in Megatron Core using the LLaVA architecture, CLIP vision encoders, and Megatron Energon for multimodal data loading."
+keywords: ["multimodal", "vision language model", "vlm", "llava", "clip", "energon", "image", "video"]
+---
+
+Megatron Core supports multimodal training through a LLaVA-style vision-language model (VLM) architecture. A visual encoder extracts image features, a multimodal projector maps them into the language model's embedding space, and a language model decoder generates text conditioned on the visual inputs.
+
+<Note>
+Multimodal support in Megatron is under active development. This feature is intended to demonstrate the multimodal functionality and is not yet optimized for state-of-the-art model quality.
+</Note>
+
+## Supported modalities
+
+<CardGroup cols={2}>
+  <Card title="Images" icon="image">
+    Static images processed through CLIP ViT or RADIO vision encoders. Supports COCO captioning and visual question answering benchmarks.
+  </Card>
+  <Card title="Video" icon="video">
+    Multi-frame video sequences using the same vision encoder pipeline with temporal token handling.
+  </Card>
+  <Card title="Text" icon="file-text">
+    Natural language instructions, captions, and question–answer pairs. Fully integrated with Megatron's tokenizer and language model training pipeline.
+  </Card>
+  <Card title="Audio (via Energon)" icon="volume-2">
+    Audio modality is supported by the Megatron Energon dataloader for multimodal dataset blending and streaming.
+  </Card>
+</CardGroup>
+
+## Model architecture
+
+The `LLaVAModel` in `megatron/core/models/multimodal/llava_model.py` composes three sub-models:
+
+```
+Input image
+    │
+    ▼
+Vision encoder (CLIP ViT / RADIO)
+    │  [image patch embeddings]
+    ▼
+Multimodal projector (2-layer MLP)
+    │  [projected visual tokens]
+    ▼
+Language model decoder (GPT / Mamba)
+    │  [text tokens interleaved with visual tokens]
+    ▼
+Output text
+```
+
+Special tokens mark image boundaries in the token sequence: `<image>` for static images and `<video>` for video inputs. During training, visual tokens replace the `<image>` placeholder in the text sequence.
+
+### Vision encoders
+
+| Encoder | Description | Source |
+|---------|-------------|--------|
+| **CLIP ViT-L/14@336px** | OpenAI CLIP visual encoder; produces 576 patch tokens per image at 336×336 resolution | `megatron/core/models/vision/clip_vit_model.py` |
+| **RADIO** | NVIDIA RADIO multi-teacher distillation visual encoder; stronger spatial features | `megatron/core/models/vision/radio.py` |
+
+### Language model backends
+
+The language model backbone can be any GPT-class model (Mistral, Llama, etc.) or a Mamba hybrid model. The backbone is loaded from a pretrained Megatron checkpoint and fine-tuned during VLM training.
+
+## Megatron Energon dataloader
+
+Megatron Energon is the recommended dataloader for multimodal training. It handles efficient streaming of mixed-modality datasets at scale.
+
+### Installation
+
+```bash
+pip install megatron-energon
+```
+
+### Basic usage
+
+```python
+from megatron.energon import get_train_dataset, get_loader, WorkerConfig
+
+# Load a multimodal dataset
+ds = get_train_dataset(
+    '/path/to/multimodal/dataset',
+    batch_size=32,
+    shuffle_buffer_size=1000,
+    worker_config=WorkerConfig(
+        num_workers=8,
+        prefetch_factor=2,
+        persistent_workers=True,
+    ),
+)
+
+for batch in get_loader(ds):
+    images = batch['image']   # Image tensors: [B, C, H, W]
+    texts  = batch['text']    # Text captions or prompts
+    # Run training step
+```
+
+### Dataset blending
+
+Mix multiple datasets with custom sampling weights:
+
+```python
+from megatron.energon import Blender
+
+blended_ds = Blender([
+    ('/path/to/caption_dataset',   0.6),  # 60% image captioning
+    ('/path/to/vqa_dataset',       0.3),  # 30% visual question answering
+    ('/path/to/instruction_data',  0.1),  # 10% instruction tuning
+])
+```
+
+### Worker configuration
+
+| Parameter | Description |
+|-----------|-------------|
+| `num_workers` | Parallel data loading workers |
+| `prefetch_factor` | Batches to prefetch per worker |
+| `persistent_workers` | Keep workers alive between epochs |
+| `batch_size` | Samples per batch |
+| `shuffle_buffer_size` | Randomization buffer size |
+| `max_samples_per_sequence` | Maximum samples to pack into one sequence |
+
+### Integration with Megatron-LM training
+
+```python
+from megatron.energon import get_train_dataset, get_loader
+from megatron.training import get_args
+
+args = get_args()
+
+train_ds = get_train_dataset(
+    args.data_path,
+    batch_size=args.micro_batch_size,
+)
+
+for iteration, batch in enumerate(get_loader(train_ds)):
+    loss = train_step(batch)
+```
+
+## Data format requirements
+
+Multimodal datasets must be in **WebDataset** format prepared with the `energon prepare` command. Each sample contains image and text fields; the field mapping is configured during preparation.
+
+### Preparing the LLaVA-Pretrain dataset
+
+<Steps>
+  <Step title="Download the dataset">
+    ```bash
+    git clone https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain
+    cd LLaVA-Pretrain
+    unzip images.zip
+    ```
+  </Step>
+
+  <Step title="Convert to WebDataset format">
+    ```bash
+    cd <megatron-lm dir>
+    python examples/multimodal/convert_llava_pretrain_to_wds.py
+    ```
+  </Step>
+
+  <Step title="Run energon prepare">
+    ```bash
+    cd LLaVA-Pretrain/wds
+    energon prepare ./
+    ```
+
+    When prompted, use these values:
+
+    ```
+    Train/val/test split: 9,1,0
+    Create dataset.yaml interactively: Y
+    Sample class: 9 (VQASample)
+    Use simple field_map: Y
+    Field for 'image': jpg
+    Field for 'context': json[0][value]
+    Field for 'answers': json[1][value]
+    Field for 'answer_weights': (leave empty)
+    ```
+  </Step>
+
+  <Step title="Update dataset.yaml">
+    Edit `pretrain_dataset.yaml` so both `path` variables point to `LLaVA-Pretrain/wds`.
+  </Step>
+</Steps>
+
+## Training a vision-language model
+
+The multimodal training pipeline has two phases: pretraining (train only the projection layer) and supervised fine-tuning (SFT, train the full model).
+
+### Setup
+
+<Steps>
+  <Step title="Build the Docker container">
+    ```bash
+    # At the Megatron-LM root directory
+    docker build -t megatron-multimodal -f examples/multimodal/Dockerfile .
+    ```
+  </Step>
+
+  <Step title="Prepare the language model checkpoint">
+    Download Mistral-7B-Instruct-v0.3 from HuggingFace and convert to Megatron Core format with TP=4. Follow the instructions in `docs/llama_mistral.md`.
+  </Step>
+
+  <Step title="Download and convert the vision model">
+    Download the OpenAI CLIP ViT-L/14@336px weights and convert them to Megatron format:
+
+    ```bash
+    python examples/multimodal/model_converter/clip_converter.py \
+        --download-root /some/download/folder \
+        --output /some/output/folder \
+        --tensor-parallel-size 4 \
+        --use-te
+    ```
+  </Step>
+
+  <Step title="Combine model checkpoints">
+    ```bash
+    examples/multimodal/combine_lm_vision_checkpoints.sh \
+        /path/to/mistral/model \
+        /path/to/clip/model \
+        /output/dir
+    ```
+  </Step>
+</Steps>
+
+### Pretraining (projection layer only)
+
+Pretraining trains only the multimodal projector while keeping the vision encoder and language model frozen. This aligns the visual feature space to the language model's embedding space.
+
+```bash
+examples/multimodal/pretrain_mistral_clip.sh
+```
+
+Training and validation loss should converge within roughly 1 day on 64 A100 GPUs with global batch size 256. Loss curves alone are unreliable predictors of downstream performance; evaluate with zero-shot benchmarks.
+
+### Supervised fine-tuning (SFT)
+
+SFT trains the full model on instruction-following data. Prepare your dataset in megatron-energon format (see [Energon data prep docs](https://nvidia.github.io/Megatron-Energon/data_prep.html)), update `sft_dataset.yaml`, then run:
+
+```bash
+examples/multimodal/sft_mistral_clip.sh
+```
+
+Both pretraining and SFT scripts support resuming from the latest checkpoint automatically.
+
+### Text generation and evaluation
+
+```bash
+examples/multimodal/text_generation_mistral_clip.sh \
+    --input-image-path /path/to/input/images \
+    --output-path /some/output/directory \
+    --model-path /path/to/model.pt \
+    --gt-path /path/to/groundtruth/file \
+    --task captioning   # or MMMU
+```
+
+After pretraining, the Mistral-7B + CLIP LLaVA model achieves approximately **94 CIDer** on COCO captioning. After SFT, it achieves approximately **38** on MMMU.
+
+## Model configuration
+
+The `LLaVAModel` constructor accepts separate `TransformerConfig` objects for the language model, vision encoder, and projection head. Key parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `language_transformer_config` | Transformer config for the language backbone |
+| `vision_transformer_config` | Transformer config for the vision encoder |
+| `vision_projection_config` | Config for the 2-layer MLP projector |
+| `vision_projection_type` | Projection type (default: `"mlp"`) |
+| `img_h`, `img_w` | Input image dimensions in pixels |
+| `patch_dim` | Size of each image patch (e.g., 14 for ViT-L/14) |
+| `drop_vision_class_token` | Drop the CLS token before language model (default: True) |
+| `add_encoder` / `add_decoder` | Control pipeline parallel stage placement |
+
+## Parallelism
+
+<Tip>
+The example multimodal training scripts use four-way tensor parallelism (`TP=4`). Pretraining and SFT on 64 A100 GPUs took approximately 1 day and 11 hours respectively.
+</Tip>
+
+The LLaVA model supports pipeline parallelism with separate encoder and decoder placement. When using PP:
+
+- The vision encoder (`add_encoder=True`) lives on the first pipeline stage.
+- The language model decoder (`add_decoder=True`) is distributed across subsequent stages.
+- Context parallelism for the multimodal model is implemented in `megatron/core/models/multimodal/context_parallel.py`.

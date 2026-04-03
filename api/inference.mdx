@@ -1,0 +1,451 @@
+---
+title: "Inference API"
+description: "InferenceParams (StaticInferenceContext), SamplingParams, InferenceRequest, and end-to-end inference setup."
+---
+
+Megatron-LM provides a layered inference API: low-level KV-cache contexts for embedding inference into a training loop, and higher-level request/sampling objects for standalone text generation.
+
+## InferenceParams / StaticInferenceContext
+
+`megatron.core.InferenceParams`
+`megatron.core.inference.contexts.StaticInferenceContext`
+
+`InferenceParams` is an alias for `StaticInferenceContext`. It manages the KV-cache dictionaries and sequence/batch offset bookkeeping required for autoregressive generation with a fixed batch size.
+
+```python
+from megatron.core import InferenceParams
+# or equivalently:
+from megatron.core.inference.contexts import StaticInferenceContext as InferenceParams
+
+inference_params = InferenceParams(
+    max_batch_size=8,
+    max_sequence_length=2048,
+)
+```
+
+### Constructor
+
+```python
+StaticInferenceContext(
+    max_batch_size: int,
+    max_sequence_length: int,
+    use_flashinfer_fused_rope: bool = None,
+)
+```
+
+<ParamField path="max_batch_size" type="int" required>
+  Maximum number of sequences in a single forward pass. Determines the second dimension of preallocated KV-cache tensors.
+</ParamField>
+
+<ParamField path="max_sequence_length" type="int" required>
+  Maximum total sequence length (prompt + generated tokens). KV-cache tensors are preallocated to this length.
+</ParamField>
+
+### Key attributes and methods
+
+<ResponseField name="sequence_len_offset" type="int">
+  Current position in the sequence; incremented after each generation step. The model uses this to index into the KV cache.
+</ResponseField>
+
+<ResponseField name="batch_size_offset" type="int">
+  Current batch offset for chunked-batch inference.
+</ResponseField>
+
+<ResponseField name="key_value_memory_dict" type="Dict[int, Tuple[Tensor, Tensor]]">
+  Maps layer number to `(key_cache, value_cache)` tensors. Populated by attention layers during the forward pass.
+</ResponseField>
+
+<ResponseField name="decode_mode" type="bool">
+  `True` when processing decode (single new token) steps; `False` during prefill.
+</ResponseField>
+
+**Methods:**
+
+```python
+# Switch between prefill and decode phases
+inference_params.enable_prefill_mode()   # process prompt tokens
+inference_params.enable_decode_mode()    # generate single tokens
+
+# Reset for a new batch
+inference_params.reset()
+
+# Swap KV-cache rows for beam search or dynamic batching
+inference_params.swap_key_value_dict(batch_idx)
+```
+
+### Usage pattern
+
+```python
+from megatron.core import InferenceParams
+import torch
+
+inference_params = InferenceParams(
+    max_batch_size=4,
+    max_sequence_length=512,
+)
+
+# Prefill: process the prompt
+inference_params.enable_prefill_mode()
+with torch.no_grad():
+    logits = model(input_ids=prompt_tokens,
+                   position_ids=None,
+                   attention_mask=None,
+                   inference_params=inference_params)
+
+inference_params.sequence_len_offset += prompt_tokens.shape[1]
+
+# Decode: generate tokens one at a time
+inference_params.enable_decode_mode()
+for _ in range(max_new_tokens):
+    next_token_logits = model(
+        input_ids=next_token.unsqueeze(1),
+        position_ids=None,
+        attention_mask=None,
+        inference_params=inference_params,
+    )[:, -1, :]
+    next_token = next_token_logits.argmax(dim=-1)
+    inference_params.sequence_len_offset += 1
+```
+
+---
+
+## SamplingParams
+
+`megatron.core.inference.sampling_params.SamplingParams`
+
+A `@dataclass` containing per-request parameters that control token sampling. Passed inside an `InferenceRequest` to the text-generation engine.
+
+```python
+from megatron.core.inference.sampling_params import SamplingParams
+
+params = SamplingParams(
+    temperature=0.8,
+    top_k=50,
+    top_p=0.95,
+    num_tokens_to_generate=256,
+    return_log_probs=True,
+)
+```
+
+### Fields
+
+<ParamField path="temperature" type="float" default="1.0">
+  Softmax temperature for sampling. Lower values (e.g. `0.1`) make the distribution more peaked (closer to greedy); higher values (e.g. `1.5`) make it flatter (more random). Use `1.0` for unmodified logits.
+</ParamField>
+
+<ParamField path="top_k" type="int" default="0">
+  Keep only the top-K most probable tokens before sampling. `0` disables top-K filtering.
+</ParamField>
+
+<ParamField path="top_p" type="float" default="0.0">
+  Nucleus sampling threshold: keep the smallest set of tokens whose cumulative probability exceeds `top_p`. `0.0` disables nucleus sampling.
+</ParamField>
+
+<ParamField path="num_tokens_to_generate" type="int" default="None">
+  Number of new tokens to generate. Mutually exclusive with `num_tokens_total`.
+</ParamField>
+
+<ParamField path="num_tokens_total" type="Optional[int]" default="None">
+  Total token budget (prompt + generated). Cannot be set together with `num_tokens_to_generate`.
+</ParamField>
+
+<ParamField path="termination_id" type="Optional[int]" default="None">
+  Token ID that triggers end-of-generation (e.g. the EOS token ID). Generation stops when this token is produced.
+</ParamField>
+
+<ParamField path="return_log_probs" type="bool" default="False">
+  Return log-probabilities for each generated token.
+</ParamField>
+
+<ParamField path="skip_prompt_log_probs" type="bool" default="False">
+  When `return_log_probs=True`, omit prompt token log-probabilities and return only generated-token log-probs.
+</ParamField>
+
+<ParamField path="top_n_logprobs" type="int" default="0">
+  For each generated token, return the top-N alternative token log-probabilities. `0` disables this feature.
+</ParamField>
+
+<ParamField path="add_BOS" type="bool" default="False">
+  Prepend a beginning-of-sequence token to the prompt before generation.
+</ParamField>
+
+<ParamField path="stop_words" type="Optional[List[str]]" default="None">
+  List of strings that will terminate generation when produced.
+</ParamField>
+
+<ParamField path="detokenize_stop_sequence" type="bool" default="False">
+  When `True`, keep stop words and the EOD token in the returned generated text.
+</ParamField>
+
+<ParamField path="return_segments" type="bool" default="False">
+  Return individually detokenized tokens as a list of strings in addition to the full generated text.
+</ParamField>
+
+### Utility methods
+
+```python
+# Add custom attributes not defined in the dataclass
+params.add_attributes({'min_length': 10, 'eod_id': 2})
+
+# Serialize to a msgpack-compatible dict (for sending over a network)
+d = params.serialize()
+
+# Reconstruct from a serialized dict
+params2 = SamplingParams.deserialize(d)
+```
+
+---
+
+## InferenceRequest
+
+`megatron.core.inference.inference_request.InferenceRequest`
+
+Holds the complete state of a single inference request: the input prompt, sampling configuration, and all generated outputs. The text-generation engine populates output fields as generation proceeds.
+
+```python
+from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.sampling_params import SamplingParams
+
+request = InferenceRequest(
+    request_id=42,
+    prompt="The quick brown fox",
+    sampling_params=SamplingParams(
+        temperature=0.7,
+        top_p=0.9,
+        num_tokens_to_generate=128,
+    ),
+)
+```
+
+### Fields
+
+<ParamField path="request_id" type="int" required>
+  Unique identifier for this request within the engine.
+</ParamField>
+
+<ParamField path="prompt" type="str" required>
+  The text prompt. The engine tokenizes this before the forward pass.
+</ParamField>
+
+<ParamField path="sampling_params" type="Optional[SamplingParams]" default="None">
+  Sampling configuration for this request.
+</ParamField>
+
+<ParamField path="prompt_tokens" type="Optional[List[int]]" default="None">
+  Pre-tokenized prompt token IDs. When provided, the engine skips tokenization.
+</ParamField>
+
+<ParamField path="arrival_time" type="Optional[float]" default="None">
+  Unix timestamp of when the request arrived. Used for latency metrics.
+</ParamField>
+
+<ParamField path="encoder_prompt" type="Optional[str]" default="None">
+  Encoder-side prompt for encoder-decoder models.
+</ParamField>
+
+### Output fields (populated by the engine)
+
+<ResponseField name="status" type="Optional[Status]">
+  Current lifecycle state. One of `WAITING_IN_QUEUE`, `ACTIVE_AND_GENERATING_TOKENS`, `ACTIVE_BUT_NOT_GENERATING_TOKENS`, `COMPLETED`, or `FAILED`.
+</ResponseField>
+
+<ResponseField name="generated_text" type="Optional[str]">
+  Decoded generated text (populated after generation completes).
+</ResponseField>
+
+<ResponseField name="generated_tokens" type="Optional[torch.Tensor]">
+  Raw generated token IDs as a 1-D integer tensor.
+</ResponseField>
+
+<ResponseField name="generated_log_probs" type="Optional[torch.Tensor]">
+  Log-probabilities for each generated token. Populated when `sampling_params.return_log_probs=True`.
+</ResponseField>
+
+<ResponseField name="prompt_log_probs" type="Optional[torch.Tensor]">
+  Log-probabilities over prompt tokens. Populated when `return_log_probs=True` and `skip_prompt_log_probs=False`.
+</ResponseField>
+
+<ResponseField name="generated_top_n_logprobs" type="Optional[List[Dict[str, float]]]">
+  Top-N alternative token log-probs per generation step. Populated when `sampling_params.top_n_logprobs > 0`.
+</ResponseField>
+
+<ResponseField name="generated_length" type="Optional[int]">
+  Number of tokens generated.
+</ResponseField>
+
+<ResponseField name="tpot" type="Optional[List[int]]">
+  Time-per-output-token measurements (in microseconds) for each generated token.
+</ResponseField>
+
+### Serialization
+
+```python
+# Serialize for transmission (e.g. across network)
+d = request.serialize()
+
+# Deserialize
+request2 = InferenceRequest.deserialize(d)
+```
+
+---
+
+## DynamicInferenceRequest
+
+`megatron.core.inference.inference_request.DynamicInferenceRequest`
+
+An extension of `InferenceRequest` for the continuous-batching (dynamic) inference engine. Adds chunked-prefill support, prefix caching, MoE routing index tracking, and lifecycle event logging.
+
+```python
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+
+request = DynamicInferenceRequest(
+    request_id=1,
+    prompt_tokens=torch.tensor([1, 2, 3, 4, 5]),
+    sampling_params=SamplingParams(
+        temperature=0.9,
+        top_k=40,
+        num_tokens_to_generate=200,
+        termination_id=2,  # EOS token ID
+    ),
+    enable_prefix_caching=True,
+    block_size_tokens=64,
+)
+```
+
+### Additional fields
+
+<ParamField path="remaining_prompt_tokens" type="Optional[torch.Tensor]" default="None">
+  Tokens yet to be prefilled. Used internally by the chunked-prefill scheduler; initialized to `prompt_tokens`.
+</ParamField>
+
+<ParamField path="enable_prefix_caching" type="bool" default="False">
+  Enable KV-cache block prefix matching to avoid recomputing prompts that share a common prefix.
+</ParamField>
+
+<ParamField path="block_size_tokens" type="Optional[int]" default="None">
+  Block size (in tokens) used for prefix-cache hash computation. Must be set when `enable_prefix_caching=True`.
+</ParamField>
+
+---
+
+## Status enum
+
+```python
+from megatron.core.inference.inference_request import Status
+
+Status.WAITING_IN_QUEUE              # Request queued, not yet scheduled
+Status.ACTIVE_AND_GENERATING_TOKENS  # Being decoded
+Status.ACTIVE_BUT_NOT_GENERATING_TOKENS  # In the engine but paused (e.g. chunked prefill)
+Status.COMPLETED                     # Generation finished successfully
+Status.FAILED                        # Generation failed (check engine logs)
+```
+
+---
+
+## End-to-end inference example
+
+The following example shows a complete standalone inference setup using `StaticInferenceContext` with a pre-trained GPT model:
+
+```python
+import torch
+import torch.distributed as dist
+from megatron.core import parallel_state, InferenceParams
+from megatron.core.models.gpt import GPTModel
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.inference.sampling_params import SamplingParams
+
+# 1. Initialize distributed (single GPU example)
+dist.init_process_group(backend='nccl')
+parallel_state.initialize_model_parallel(
+    tensor_model_parallel_size=1,
+    pipeline_model_parallel_size=1,
+)
+
+# 2. Build model config
+config = TransformerConfig(
+    num_layers=24,
+    hidden_size=1024,
+    num_attention_heads=16,
+    bf16=True,
+    params_dtype=torch.bfloat16,
+)
+
+# 3. Instantiate model and load checkpoint
+model = GPTModel(
+    config=config,
+    transformer_layer_spec=my_layer_spec,
+    vocab_size=50257,
+    max_sequence_length=2048,
+    position_embedding_type='rope',
+).cuda().bfloat16()
+
+# load_checkpoint(model, ...)  # omitted for brevity
+
+# 4. Create KV-cache context
+inference_params = InferenceParams(
+    max_batch_size=1,
+    max_sequence_length=2048,
+)
+
+# 5. Tokenize and prefill
+tokenizer = ...   # your tokenizer
+prompt = "Megatron-LM is a library for"
+input_ids = torch.tensor([tokenizer.encode(prompt)], device='cuda')
+prompt_len = input_ids.shape[1]
+
+sampling_params = SamplingParams(
+    temperature=0.8,
+    top_p=0.9,
+    num_tokens_to_generate=128,
+    termination_id=tokenizer.eos_id,
+)
+
+model.eval()
+inference_params.enable_prefill_mode()
+with torch.no_grad():
+    _ = model(input_ids=input_ids,
+              position_ids=None,
+              attention_mask=None,
+              inference_params=inference_params)
+
+inference_params.sequence_len_offset += prompt_len
+inference_params.enable_decode_mode()
+
+# 6. Decode loop
+generated_ids = []
+current_token = input_ids[:, -1:]
+
+for _ in range(sampling_params.num_tokens_to_generate):
+    with torch.no_grad():
+        logits = model(
+            input_ids=current_token,
+            position_ids=None,
+            attention_mask=None,
+            inference_params=inference_params,
+        )
+
+    next_logits = logits[:, -1, :] / sampling_params.temperature
+
+    # top-p filtering
+    if sampling_params.top_p > 0:
+        sorted_logits, sorted_idx = torch.sort(next_logits, descending=True)
+        cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_logits[cumprobs > sampling_params.top_p] = -float('inf')
+        next_logits.scatter_(1, sorted_idx, sorted_logits)
+
+    next_token = torch.multinomial(torch.softmax(next_logits, dim=-1), 1)
+    generated_ids.append(next_token.item())
+
+    if next_token.item() == sampling_params.termination_id:
+        break
+
+    current_token = next_token
+    inference_params.sequence_len_offset += 1
+
+generated_text = tokenizer.decode(generated_ids)
+print(generated_text)
+```
+
+<Tip>
+For production inference with continuous batching, use `DynamicInferenceRequest` with a `DynamicInferenceContext`. The dynamic context handles variable-length sequences, chunked prefill, and prefix caching automatically.
+</Tip>

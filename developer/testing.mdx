@@ -1,0 +1,127 @@
+---
+title: "Testing"
+description: "How to run tests, understand the test suite structure, and use CI markers in Megatron-LM."
+---
+
+Megatron-LM has a comprehensive test suite under `tests/`. Tests cover unit-level components, integration scenarios, and functional training runs.
+
+## Test suite layout
+
+```
+tests/
+├── unit_tests/          # Fast unit tests for individual modules
+│   ├── transformer/     # Transformer block and attention tests
+│   ├── models/          # GPT, BERT, T5, Mamba model tests
+│   ├── tensor_parallel/ # Tensor parallelism tests
+│   ├── pipeline_parallel/
+│   ├── dist_checkpointing/
+│   ├── inference/
+│   ├── optimizer/
+│   └── ...
+└── functional_tests/    # End-to-end training runs
+```
+
+## Running tests
+
+<Steps>
+  <Step title="Install test dependencies">
+    ```bash
+    uv pip install -e ".[dev]" --group test
+    ```
+  </Step>
+  <Step title="Run the full unit test suite">
+    ```bash
+    pytest tests/unit_tests/
+    ```
+  </Step>
+  <Step title="Run a specific test file or directory">
+    ```bash
+    pytest tests/unit_tests/transformer/
+    pytest tests/unit_tests/models/test_gpt_model.py
+    ```
+  </Step>
+  <Step title="Run with coverage reporting">
+    ```bash
+    pytest tests/unit_tests/ --cov=megatron/core --cov-report=html
+    ```
+  </Step>
+</Steps>
+
+## Test markers
+
+Markers are defined in `pyproject.toml` and can be used to filter runs:
+
+| Marker | Description |
+|---|---|
+| `internal` | Tests for private/internal functions not part of the public API |
+| `flaky` | Known flaky tests in LTS environments |
+| `flaky_in_dev` | Known flaky tests in dev environments |
+
+<CodeGroup>
+```bash Run excluding flaky tests
+pytest tests/unit_tests/ -m "not flaky"
+```
+```bash Run only internal tests
+pytest tests/unit_tests/ -m internal
+```
+```bash Run with random ordering
+pytest tests/unit_tests/ --random-order
+```
+</CodeGroup>
+
+## Default pytest options
+
+The following options are set by default in `pyproject.toml`:
+
+```toml pyproject.toml
+[tool.pytest.ini_options]
+addopts = "--durations=15 -s -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"
+```
+
+- `--durations=15` — show the 15 slowest tests after each run
+- `-s` — don't capture stdout (useful for debugging)
+- `-rA` — show a short test summary for all outcomes
+- `-x` — stop on first failure
+
+<Tip>
+Remove `-x` when you want to collect all failures in one pass: `pytest tests/unit_tests/ -p no:randomly --override-ini="addopts=-s -rA"`.
+</Tip>
+
+## Multi-GPU tests
+
+Some tests require multiple GPUs and use `torchrun` directly:
+
+```bash
+torchrun --nproc_per_node=8 -m pytest tests/unit_tests/tensor_parallel/
+```
+
+<Note>
+Multi-GPU tests are typically run in CI against a GPU cluster. Running them locally requires at least 2–8 NVIDIA GPUs depending on the parallelism configuration under test.
+</Note>
+
+## Linting and code style
+
+Before submitting a PR, run the linters locally:
+
+```bash
+# Format with black
+black megatron/ --check
+
+# Import order
+isort megatron/ --check-only
+
+# Ruff (fast linter)
+ruff check megatron/
+
+# Flake8
+flake8 megatron/
+```
+
+Or use pre-commit to run all checks automatically:
+
+```bash
+pre-commit install
+pre-commit run --all-files
+```

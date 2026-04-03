@@ -1,0 +1,356 @@
+---
+title: "Inference"
+description: "Run text generation with Megatron Core's inference engine, including static batching, dynamic batching, sampling parameters, and a REST text generation server."
+keywords: ["inference", "text generation", "sampling", "kv cache", "tensor parallel", "batch inference"]
+---
+
+Megatron Core provides a flexible inference engine for running text generation on models trained with Megatron-LM. The engine supports static and dynamic batching, tensor parallel execution, prefix caching, and speculative decoding.
+
+## Architecture overview
+
+The inference system is composed of four layered components:
+
+<CardGroup cols={2}>
+  <Card title="Inference engine" icon="engine">
+    Manages the request lifecycle: scheduling, batching, and calling the text generation controller. Supports static and dynamic batching modes.
+  </Card>
+  <Card title="Text generation controller" icon="rotate">
+    Implements the autoregressive sampling loop: tokenization, forward passes, logit sampling, and detokenization.
+  </Card>
+  <Card title="Inference wrapper" icon="box">
+    Adapts a specific model (GPT, T5, etc.) to the inference interface. Handles model-parallel forward passes and input slicing.
+  </Card>
+  <Card title="Sampling params" icon="sliders">
+    Per-request configuration for temperature, top-k, top-p, stop words, log probabilities, and token budget.
+  </Card>
+</CardGroup>
+
+## Setting up inference
+
+<Steps>
+  <Step title="Initialize Megatron and load the model">
+    Initialize the distributed environment and load the model checkpoint:
+
+    ```python
+    from megatron.training import initialize_megatron, get_model
+    from megatron.training.checkpointing import load_checkpoint
+
+    initialize_megatron(
+        args_defaults={
+            'no_load_rng': True,
+            'no_load_optim': True,
+            'micro_batch_size': 1,
+        }
+    )
+
+    model = get_model(model_provider, wrap_with_ddp=False)
+    load_checkpoint(model, None, None)
+    model.eval()
+    model = model[0]
+    ```
+  </Step>
+
+  <Step title="Create an inference wrapper">
+    Wrap the model in an inference-compatible interface. For GPT-family models, use `GPTInferenceWrapper`:
+
+    ```python
+    from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+        GPTInferenceWrapper,
+    )
+    from megatron.training import get_args
+
+    args = get_args()
+    inference_wrapped_model = GPTInferenceWrapper(model, args)
+    ```
+  </Step>
+
+  <Step title="Create a text generation controller">
+    The controller handles tokenization, the sampling loop, and detokenization:
+
+    ```python
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    text_generation_controller = TextGenerationController(
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
+    )
+    ```
+  </Step>
+
+  <Step title="Choose an engine and generate text">
+    Wrap the controller in a static or dynamic inference engine and call `generate()`:
+
+    ```python
+    from megatron.core.inference.engines.mcore_engine import StaticInferenceEngine
+    from megatron.core.inference.sampling_params import SamplingParams
+    from megatron.core.inference.inference_request import InferenceRequest
+    from typing import List
+    import torch
+
+    inference_engine = StaticInferenceEngine(
+        text_generation_controller=text_generation_controller,
+        max_batch_size=args.max_batch_size,
+    )
+
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_k=50,
+        top_p=0.95,
+        num_tokens_to_generate=100,
+    )
+
+    results: List[InferenceRequest] = inference_engine.generate(
+        prompts=["Once upon a time", "The capital of France is"],
+        sampling_params=sampling_params,
+    )
+
+    if torch.distributed.get_rank() == 0:
+        for result in results:
+            print(f"Prompt:    {result.prompt}")
+            print(f"Generated: {result.generated_text}")
+    ```
+  </Step>
+</Steps>
+
+## Sampling parameters
+
+`SamplingParams` controls the decoding strategy per request. All fields are optional with sensible defaults.
+
+```python
+from megatron.core.inference.sampling_params import SamplingParams
+
+sampling_params = SamplingParams(
+    temperature=1.0,          # Sampling temperature; 1.0 = unmodified logits
+    top_k=0,                  # 0 = disabled; otherwise keep top-k logits
+    top_p=0.0,                # 0.0 = disabled; otherwise nucleus sampling threshold
+    num_tokens_to_generate=50,# Number of new tokens to generate
+    return_log_probs=False,   # Return per-token log probabilities
+    top_n_logprobs=0,         # Return top-N logprob candidates per token
+    add_BOS=False,            # Prepend BOS token to prompt
+    stop_words=None,          # List of strings that halt generation when produced
+    termination_id=None,      # Token ID that halts generation
+)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `temperature` | float | 1.0 | Scales logits before sampling. Lower = more deterministic. |
+| `top_k` | int | 0 | Sample only from the top-k most probable tokens. 0 disables. |
+| `top_p` | float | 0.0 | Nucleus sampling: restrict to smallest set of tokens with cumulative probability ≥ p. 0.0 disables. |
+| `num_tokens_to_generate` | int | None | Number of new tokens to produce. |
+| `num_tokens_total` | int | None | Total token budget (prompt + output). Cannot be set with `num_tokens_to_generate`. |
+| `return_log_probs` | bool | False | Return per-token log probabilities in the result. |
+| `skip_prompt_log_probs` | bool | False | Exclude prompt tokens from returned log probabilities. |
+| `top_n_logprobs` | int | 0 | Return the top-N candidate tokens and their log probabilities at each step. |
+| `add_BOS` | bool | False | Prepend a BOS token to the prompt before tokenization. |
+| `stop_words` | list[str] | None | Stop generation when any of these strings is produced. |
+| `termination_id` | int | None | Token ID that terminates generation. |
+| `return_segments` | bool | False | Return individually detokenized tokens instead of a single string. |
+
+You can extend `SamplingParams` with custom attributes:
+
+```python
+params = SamplingParams(temperature=0.5)
+params.add_attributes({'min_length': 4, 'eod_id': 153})
+```
+
+## InferenceConfig
+
+`InferenceConfig` (`megatron/core/inference/config.py`) configures the engine-level KV cache, CUDA graphs, and request limits. Use it when constructing a dynamic inference engine:
+
+```python
+from megatron.core.inference.config import InferenceConfig
+
+config = InferenceConfig(
+    max_sequence_length=4096,  # Max prompt + output length
+    buffer_size_gb=20,         # GPU memory reserved for KV cache (GB)
+    block_size_tokens=256,     # KV cache block size in tokens
+    max_requests=64,           # Max concurrent decode requests
+    max_tokens=16384,          # Max total tokens in a forward pass
+    enable_chunked_prefill=False,
+    enable_prefix_caching=False,
+    num_cuda_graphs=None,      # Capture CUDA graphs for decode steps
+)
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_sequence_length` | 2560 | Maximum total tokens per request (prompt + output). |
+| `buffer_size_gb` | 20 | GPU memory allocated for the KV cache. |
+| `block_size_tokens` | 256 | Size of each KV cache block in tokens. |
+| `max_requests` | None | Maximum concurrent decode-phase requests. |
+| `max_tokens` | None | Maximum tokens in a single forward pass (limits prefill activation memory). |
+| `enable_chunked_prefill` | False | Process long prompts in chunks to reduce memory spikes. |
+| `enable_prefix_caching` | False | Share KV cache blocks for common prefixes across requests. |
+| `num_cuda_graphs` | None | Number of CUDA graphs to capture for decode steps (batch sizes 1–max_requests). |
+| `num_speculative_tokens` | 0 | Speculative decoding draft tokens per step. |
+| `unified_memory_level` | 0 | Enable CPU unified memory for the KV cache buffer (level 1). |
+
+## Text generation server
+
+Megatron-LM includes a Flask-based REST server for serving text generation requests. It is suitable for development and small-scale serving.
+
+<Steps>
+  <Step title="Install the server dependency">
+    ```bash
+    pip install flask-restful
+    ```
+  </Step>
+
+  <Step title="Launch the server">
+    Use `torchrun` to launch the generation server. The example below serves a 345M GPT model on a single GPU:
+
+    ```bash
+    CHECKPOINT=/path/to/checkpoint
+    VOCAB_FILE=/path/to/gpt2-vocab.json
+    MERGE_FILE=/path/to/gpt2-merges.txt
+
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+    torchrun \
+      --nproc_per_node 1 \
+      --nnodes 1 \
+      --master_addr localhost \
+      --master_port 6000 \
+      tools/run_text_generation_server.py \
+        --tensor-model-parallel-size 1 \
+        --pipeline-model-parallel-size 1 \
+        --num-layers 24 \
+        --hidden-size 1024 \
+        --num-attention-heads 16 \
+        --max-position-embeddings 1024 \
+        --tokenizer-type GPT2BPETokenizer \
+        --vocab-file $VOCAB_FILE \
+        --merge-file $MERGE_FILE \
+        --load $CHECKPOINT \
+        --fp16 \
+        --micro-batch-size 1 \
+        --seq-length 1024 \
+        --seed 42
+    ```
+
+    For a tensor-parallel serving example with 8 GPUs, see `examples/inference/run_text_generation_server_345M_8_tensor_parallel.sh`.
+  </Step>
+
+  <Step title="Query the server">
+    Once the server is running, use the CLI client to send prompts:
+
+    ```bash
+    python tools/text_generation_cli.py localhost:5000
+    ```
+  </Step>
+</Steps>
+
+For a Mixtral 8x7B serving example, refer to [examples/mixtral/README.md](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/mixtral/README.md).
+
+## Running inference with torchrun
+
+For programmatic batch inference (not the REST server), use the static inference example directly:
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+TOKENIZER_ARGS=(
+    --vocab-file /workspace/tokenizer/gpt2-vocab.json
+    --merge-file /workspace/tokenizer/gpt2-merges.txt
+    --tokenizer-type GPT2BPETokenizer
+)
+
+MODEL_ARGS=(
+    --use-checkpoint-args
+    --use-mcore-models
+    --load /workspace/mcore_gpt_ckpt
+)
+
+INFERENCE_ARGS=(
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --num-tokens-to-generate 20
+    --max-batch-size 4
+)
+
+torchrun --nproc-per-node=4 examples/inference/gpt/gpt_static_inference.py \
+    ${TOKENIZER_ARGS[@]} \
+    ${MODEL_ARGS[@]} \
+    ${INFERENCE_ARGS[@]} \
+    --prompts "What is the capital of France?" "Explain quantum entanglement"
+```
+
+Additional flags that affect inference behavior:
+
+| Flag | Description |
+|------|-------------|
+| `--temperature` | Sampling temperature |
+| `--top-k` | Top-k sampling |
+| `--top-p` | Top-p (nucleus) sampling |
+| `--num-tokens-to-generate` | Number of output tokens per prompt |
+| `--use-dist-ckpt` | Use distributed checkpoint format |
+
+## Customizing the inference pipeline
+
+The three extension points are:
+
+<Tabs>
+  <Tab title="New backend">
+    Extend `AbstractEngine` in `megatron/core/inference/engines/abstract_engine.py` to implement a new backend such as TensorRT-LLM:
+
+    ```python
+    from megatron.core.inference.engines.abstract_engine import AbstractEngine
+
+    class MyEngine(AbstractEngine):
+        @staticmethod
+        def generate(self) -> dict:
+            # Implement custom batching and execution logic
+            ...
+    ```
+  </Tab>
+  <Tab title="Custom sampling loop">
+    Subclass `TextGenerationController` to override tokenization or the sampling strategy:
+
+    ```python
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    class MyController(TextGenerationController):
+        def sample_from_logits(self, last_token_logits, sampling_params, vocab_size, ...):
+            # Custom sampling logic (e.g., constrained decoding)
+            ...
+    ```
+  </Tab>
+  <Tab title="New model wrapper">
+    Extend `AbstractModelInferenceWrapper` for models with non-standard forward signatures:
+
+    ```python
+    from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+        AbstractModelInferenceWrapper,
+    )
+
+    class MyModelWrapper(AbstractModelInferenceWrapper):
+        def prep_model_for_inference(self, prompts_tokens):
+            # Build position IDs, attention masks, etc.
+            ...
+
+        def get_batch_for_context_window(self):
+            # Return the input slice for the current autoregressive step
+            ...
+    ```
+  </Tab>
+</Tabs>
+
+## Control flow
+
+The static batching engine follows this execution flow:
+
+1. `engine.generate(prompts, sampling_params)` is called with a list of prompt strings.
+2. The `Scheduler` places requests in an **active** pool (up to `max_batch_size`) and queues the rest.
+3. `TextGenerationController.generate_all_output_tokens_static_batch()` runs the autoregressive loop:
+   - `prep_model_for_inference()` is called once to build position IDs and attention masks.
+   - Each step calls `get_batch_for_context_window()` to slice inputs, then `run_one_forward_step()` to get logits.
+   - Output logits are synchronized across all pipeline parallel ranks.
+   - `sample_from_logits()` applies temperature/top-k/top-p and samples the next token.
+   - `update_generation_status()` checks stop conditions (EOS token, stop words, token budget).
+4. Completed requests are moved to the completed pool; waiting requests move to active.
+5. Results are detokenized and stored on the `InferenceRequest` objects.

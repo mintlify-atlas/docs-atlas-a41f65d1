@@ -1,0 +1,235 @@
+---
+title: "Checkpointing"
+description: "Save and resume training checkpoints with Megatron-LM, including distributed checkpointing and resharding across parallelism configurations."
+---
+
+Megatron-LM supports two checkpoint formats: a **legacy format** that writes one file per tensor-parallel/pipeline-parallel rank, and a modern **distributed checkpoint format** (`torch_dist`) built on `megatron.core.dist_checkpointing`. The distributed format is recommended for all new training runs because it supports resharding — loading a checkpoint trained with one parallelism configuration into a job running a different one.
+
+## Checkpoint Save/Load Workflow
+
+<Steps>
+  <Step title="Configure checkpoint paths in your training script">
+    Set the save and load directories. Both can point to the same path, which is the typical pattern for resuming interrupted training:
+
+    ```bash
+    --save /path/to/checkpoints \
+    --load /path/to/checkpoints \
+    --save-interval 1000
+    ```
+
+    Megatron-LM writes a tracker file (`latest_checkpointed_iteration.txt`) inside the checkpoint directory. On startup, the training script reads this file to determine which iteration to resume from.
+  </Step>
+
+  <Step title="Choose a checkpoint format">
+    Specify the checkpoint format with `--ckpt-format`:
+
+    ```bash
+    # Recommended: distributed format (supports resharding)
+    --ckpt-format torch_dist
+
+    # Legacy format (one file per parallel rank)
+    # --ckpt-format torch
+    ```
+
+    <Note>
+      The distributed format (`torch_dist`) is backed by `megatron.core.dist_checkpointing` and uses `torch.distributed.checkpoint` internally. It writes sharded tensors that can be remapped to different parallelism topologies at load time.
+    </Note>
+  </Step>
+
+  <Step title="Run training with checkpointing enabled">
+    A complete example with distributed checkpointing for LLaMA-3:
+
+    ```bash
+    torchrun --nproc_per_node 8 pretrain_gpt.py \
+        --use-mcore-models \
+        --num-layers 32 \
+        --hidden-size 4096 \
+        --num-attention-heads 32 \
+        --seq-length 8192 \
+        --max-position-embeddings 8192 \
+        --micro-batch-size 1 \
+        --global-batch-size 128 \
+        --train-iters 100000 \
+        --bf16 \
+        --ckpt-format torch_dist \
+        --save /path/to/checkpoints \
+        --load /path/to/checkpoints \
+        --save-interval 1000 \
+        --data-path /path/to/data \
+        --split 949,50,1 \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model
+    ```
+
+    Checkpoints are written to iteration-numbered subdirectories:
+
+    ```
+    /path/to/checkpoints/
+      latest_checkpointed_iteration.txt
+      iter_0001000/
+        metadata.json          # distributed ckpt config
+        common.pt              # non-tensor state (args, RNG, optimizer scalar state)
+        model/                 # sharded model tensors
+        optim/                 # sharded optimizer state
+    ```
+  </Step>
+
+  <Step title="Resume training from a checkpoint">
+    Simply re-run the same command with the same `--load` path. The trainer reads `latest_checkpointed_iteration.txt`, loads the corresponding checkpoint, and continues from where it left off:
+
+    ```bash
+    torchrun --nproc_per_node 8 pretrain_gpt.py \
+        [all original args...] \
+        --save /path/to/checkpoints \
+        --load /path/to/checkpoints
+    ```
+
+    To resume from a specific iteration rather than the latest, use:
+
+    ```bash
+    --ckpt-step 5000
+    ```
+  </Step>
+</Steps>
+
+## Checkpoint Arguments
+
+| Argument | Description |
+|---|---|
+| `--save` | Directory to write checkpoints |
+| `--load` | Directory to read checkpoints from (can match `--save`) |
+| `--save-interval` | Save a checkpoint every N training iterations |
+| `--ckpt-format` | Checkpoint format: `torch_dist` (distributed, recommended) or `torch` (legacy) |
+| `--ckpt-step` | Load a specific iteration instead of the latest |
+| `--no-save-optim` | Skip saving optimizer state (reduces checkpoint size; cannot resume training) |
+| `--no-save-rng` | Skip saving RNG state (training will not be bit-reproducible after resume) |
+| `--no-load-optim` | Do not load optimizer state from checkpoint (useful for fine-tuning) |
+| `--no-load-rng` | Do not load RNG state from checkpoint |
+| `--finetune` | Skip optimizer and RNG state on load; start training iteration counter from 0 |
+| `--use-dist-ckpt` | Explicitly enable distributed checkpointing (automatically enabled with `--ckpt-format torch_dist`) |
+| `--async-save` | Save checkpoints asynchronously to overlap I/O with training |
+| `--distributed-timeout-minutes` | Timeout for distributed checkpoint operations (default: `60`) |
+
+## Distributed Checkpointing
+
+The `megatron.core.dist_checkpointing` module provides the underlying infrastructure for distributed save and load. Each tensor in the model is wrapped with sharding metadata (`ShardedTensor`) that records its global shape, local shard shape, and position within the global tensor. At save time, every GPU writes its own shards. At load time, the framework remaps shards to the new topology.
+
+### Checkpoint Directory Layout
+
+```
+checkpoints/
+  latest_checkpointed_iteration.txt   # contains "1000"
+  iter_0001000/
+    metadata.json                     # CheckpointingConfig (sharded_backend, versions)
+    common.pt                         # args, RNG states, iteration number
+    model_0/                          # model shards (one dir per pipeline stage)
+      data_0.pt
+      data_1.pt
+      ...
+    optim/                            # distributed optimizer shards
+      dp_shard_0.pt
+      ...
+```
+
+The `metadata.json` file records which backend was used and its version, enabling forward-compatible loading as the format evolves.
+
+### Async Checkpointing
+
+For large models, checkpoint I/O can take significant time. Enable asynchronous saving to overlap I/O with the next training iteration:
+
+```bash
+--async-save
+```
+
+<Warning>
+  Async checkpointing requires sufficient host memory to hold a copy of the model parameters during the save. If memory is constrained, disable it and accept the checkpoint overhead.
+</Warning>
+
+## Resharding: Loading with Different Parallelism
+
+A key advantage of the distributed checkpoint format is **resharding** — the ability to load a checkpoint saved with one parallelism configuration and continue training (or run inference) with a different one.
+
+Common resharding scenarios:
+
+- Change tensor parallelism (e.g., TP=4 → TP=8)
+- Change pipeline parallelism (e.g., PP=4 → PP=8)
+- Move from multi-node training to single-node inference
+
+To reshard, simply point `--load` at the existing checkpoint and specify the new parallelism arguments. The `dist_checkpointing` framework handles tensor shard remapping automatically:
+
+```bash
+# Original training: TP=1, PP=1 on 8 GPUs
+torchrun --nproc_per_node 8 pretrain_gpt.py \
+    --tensor-model-parallel-size 1 \
+    --pipeline-model-parallel-size 1 \
+    --ckpt-format torch_dist \
+    --save /path/to/checkpoints \
+    [other args...]
+
+# Resume with different parallelism: TP=2, PP=2 on 8 GPUs
+torchrun --nproc_per_node 8 pretrain_gpt.py \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 2 \
+    --ckpt-format torch_dist \
+    --load /path/to/checkpoints \
+    --save /path/to/new_checkpoints \
+    [other args...]
+```
+
+<Note>
+  Resharding is only supported with the `torch_dist` checkpoint format. The legacy `torch` format encodes parallelism topology in its file layout and cannot be loaded with a different configuration.
+</Note>
+
+### Strict Loading Behavior
+
+By default, the distributed checkpoint loader assumes that unexpected keys in the checkpoint are acceptable (`assume_ok_unexpected`). You can change this behavior using `--dist-ckpt-strictness`:
+
+```bash
+# Log unexpected checkpoint keys
+--dist-ckpt-strictness log_unexpected
+
+# Raise an error on unexpected keys
+--dist-ckpt-strictness raise_unexpected
+
+# Return all mismatched keys for inspection
+--dist-ckpt-strictness return_all
+```
+
+## Checkpoint Formats Compared
+
+| Feature | Legacy (`torch`) | Distributed (`torch_dist`) |
+|---|---|---|
+| Files per checkpoint | One per parallel rank | Sharded tensors across all ranks |
+| Resharding support | No | Yes |
+| Async save | No | Yes |
+| Checkpoint size | Larger (duplicated state) | Smaller (deduplicated) |
+| ModelOpt integration | Limited | Full support |
+| Recommended for | Legacy compatibility only | All new training runs |
+
+## ModelOpt Checkpoint Integration
+
+When using ModelOpt (NVIDIA Model Optimizer) for quantization or pruning, checkpoint saving and loading is handled by the `megatron.post_training.checkpointing` module. ModelOpt state (quantization scaling factors, sparsity masks, etc.) is saved alongside the model state:
+
+```python
+from megatron.post_training.checkpointing import load_modelopt_checkpoint
+from megatron.training.checkpointing import save_checkpoint
+
+# Save includes ModelOpt state automatically when modelopt is enabled
+save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+
+# Load and restore ModelOpt state
+load_modelopt_checkpoint(model, checkpoint_dir)
+```
+
+The ModelOpt checkpoint is stored in `modelopt_state.pt` inside the iteration directory alongside the Megatron model and optimizer shards.
+
+## Non-Persistent Checkpoints
+
+For frequent intermediate saves (e.g., for fault tolerance without long-term retention), use non-persistent checkpoints. These are saved in a `non_persistent/` subdirectory and are automatically overwritten by each subsequent non-persistent save:
+
+```bash
+--non-persistent-save-interval 100 \
+--non-persistent-ckpt-type global
+```
+
+Non-persistent checkpoints use the same distributed format and support the same resharding capabilities as regular checkpoints.

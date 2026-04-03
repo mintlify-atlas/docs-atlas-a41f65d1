@@ -1,0 +1,80 @@
+---
+title: "Ecosystem & Integrations"
+description: "Libraries that power Megatron Core, libraries that build on it, and compatible frameworks."
+---
+
+Megatron-LM sits at the center of NVIDIA's large-scale training ecosystem. This page covers the libraries that Megatron Core depends on, those that extend it, and third-party frameworks it's compatible with.
+
+## Libraries used by Megatron Core
+
+These libraries are used internally by Megatron Core to provide GPU-optimized kernels, multi-modal data loading, and fault tolerance.
+
+<CardGroup cols={2}>
+  <Card title="Transformer Engine" icon="microchip" href="https://github.com/NVIDIA/TransformerEngine">
+    NVIDIA-optimized transformer kernels with native FP8 mixed-precision support for Hopper and Blackwell GPUs. Required for FP8 training.
+  </Card>
+  <Card title="Megatron Energon" icon="database" href="https://github.com/NVIDIA/Megatron-Energon">
+    High-performance multi-modal data loader for text, images, video, and audio. Supports distributed loading, dataset blending, and WebDataset format.
+  </Card>
+  <Card title="NVRx (nvidia-resiliency-ext)" icon="shield-halved" href="https://github.com/NVIDIA/nvidia-resiliency-ext">
+    Fault-tolerant training extension with failure detection, straggler mitigation, and automatic recovery for large multi-node runs.
+  </Card>
+  <Card title="FlashMLA" icon="bolt" href="https://github.com/deepseek-ai/FlashMLA">
+    Flash multi-latent attention kernels from DeepSeek, used for efficient MLA computation in MoE models like DeepSeek-V3.
+  </Card>
+</CardGroup>
+
+## Libraries that build on Megatron Core
+
+<CardGroup cols={2}>
+  <Card title="Megatron Bridge" icon="arrows-left-right" href="https://github.com/NVIDIA-NeMo/Megatron-Bridge">
+    Bidirectional checkpoint conversion between Hugging Face and Megatron formats. Parallelism-aware, in-memory conversion with production-ready training recipes.
+  </Card>
+  <Card title="NeMo RL" icon="graduation-cap" href="https://github.com/NVIDIA-NeMo/RL">
+    Scalable post-training toolkit for RLHF, DPO, GRPO, and other reinforcement learning methods built on Megatron Core.
+  </Card>
+  <Card title="NeMo Framework" icon="layer-group" href="https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html">
+    NVIDIA's enterprise-grade training framework with cloud-native support, multi-modal pipelines, and end-to-end recipes for production LLM training.
+  </Card>
+  <Card title="Model Optimizer (ModelOpt)" icon="sliders" href="https://github.com/NVIDIA/Model-Optimizer">
+    Model optimization toolkit supporting FP8/INT8/INT4 quantization, pruning, distillation, and speculative decoding for Megatron models.
+  </Card>
+</CardGroup>
+
+## Compatible third-party frameworks
+
+Megatron Core is designed to be composable and works alongside popular distributed training frameworks:
+
+| Framework | Integration |
+|---|---|
+| [Hugging Face Accelerate](https://github.com/huggingface/accelerate) | Use Accelerate's launcher and data utilities with Megatron Core models |
+| [DeepSpeed](https://github.com/microsoft/DeepSpeed) | ZeRO optimizer stages can complement Megatron's tensor/pipeline parallelism |
+| [Colossal-AI](https://github.com/hpcaitech/ColossalAI) | Alternative parallelism strategies that can wrap Megatron Core building blocks |
+
+## Hugging Face checkpoint conversion
+
+[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) is the recommended tool for converting between Hugging Face and Megatron checkpoint formats. It performs parallelism-aware, per-parameter conversion entirely in memory — no intermediate files required.
+
+<Note>
+Megatron Bridge is a separate repository. For installation instructions, supported models, and full CLI usage, see the [Megatron Bridge repository](https://github.com/NVIDIA-NeMo/Megatron-Bridge).
+</Note>
+
+## Ecosystem overview
+
+```
+                    ┌─────────────────────────────┐
+                    │        Megatron Core         │
+                    │  (composable building blocks) │
+                    └──────────────┬──────────────┘
+                                   │ uses
+          ┌────────────────────────┼─────────────────────┐
+          │                        │                     │
+  Transformer Engine       Megatron Energon            NVRx
+  (FP8 kernels)            (multimodal data)       (fault tolerance)
+
+                    ┌──────────────┴──────────────┐
+                    │         builds on            │
+          ┌─────────┴──────┬───────────┬───────────┴──────┐
+   Megatron Bridge     NeMo RL    NeMo Framework      ModelOpt
+  (HF conversion)    (RLHF/DPO)  (enterprise)      (quantization)
+```

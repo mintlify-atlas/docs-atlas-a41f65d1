@@ -1,0 +1,172 @@
+---
+title: 'Architecture'
+description: 'Understand the two-component structure of Megatron-LM: Megatron Core (composable library) and Megatron-LM (reference implementation).'
+keywords: ['megatron core', 'megatron-lm', 'architecture', 'transformer', 'distributed training']
+---
+
+Megatron-LM is a single repository that contains two distinct components with different purposes. Understanding which component to use—and how they relate—is essential before you begin.
+
+## Two components, one repository
+
+<Tabs>
+  <Tab title="Megatron Core">
+    **Megatron Core** (`megatron/core/`) is a composable library of GPU-optimized building blocks for training large language models. It exposes modular APIs for transformer layers, parallelism primitives, optimizers, datasets, and inference—designed to be embedded inside custom training frameworks.
+
+    Megatron Core is compatible with all NVIDIA Tensor Core GPUs and popular LLM architectures including GPT, BERT, T5, LLaMA, Qwen, Mixtral, and Mamba.
+
+    ```bash
+    # Install Megatron Core as a standalone library
+    uv pip install megatron-core
+    ```
+
+    <CardGroup cols={2}>
+      <Card title="Transformer building blocks" icon="cube">
+        Composable attention, MLP, and LayerNorm modules with GPU-optimized kernels. Mix and match to build custom architectures.
+      </Card>
+      <Card title="Advanced parallelism" icon="chart-network">
+        Tensor (TP), Pipeline (PP), Data (DP), Context (CP), and Expert (EP) parallelism strategies that compose together.
+      </Card>
+      <Card title="Mixed precision" icon="gauge-high">
+        FP16, BF16, FP8, and FP4 training support via Transformer Engine integration with automatic loss scaling.
+      </Card>
+      <Card title="Distributed optimizers" icon="sliders">
+        Memory-efficient distributed optimizer that shards optimizer states across data-parallel ranks.
+      </Card>
+      <Card title="Dataset utilities" icon="database">
+        High-performance data loaders and blending utilities, including Megatron Energon for multimodal workloads.
+      </Card>
+      <Card title="Inference engines" icon="bolt">
+        Inference server and export utilities including TensorRT-LLM export support.
+      </Card>
+    </CardGroup>
+  </Tab>
+  <Tab title="Megatron-LM">
+    **Megatron-LM** is the reference implementation built on top of Megatron Core. It is the direct entry point for exploring Megatron Core and provides a complete end-to-end training setup without requiring you to wire components together yourself.
+
+    ```bash
+    # Clone the full repository (includes both components)
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    uv pip install -e .
+    ```
+
+    <CardGroup cols={2}>
+      <Card title="Pre-configured training scripts" icon="terminal">
+        Ready-to-run `pretrain_gpt.py` and similar scripts for GPT, LLaMA, DeepSeek, Qwen, and other architectures.
+      </Card>
+      <Card title="End-to-end examples" icon="book-open">
+        Complete workflows from data preparation through evaluation, covering tokenization, training, and conversion.
+      </Card>
+      <Card title="Research tools" icon="flask">
+        Flexible native PyTorch training loop with minimal abstraction layers for easy experimentation.
+      </Card>
+      <Card title="Legacy components" icon="archive">
+        Older model implementations maintained for backward compatibility in `megatron/legacy/`.
+      </Card>
+    </CardGroup>
+  </Tab>
+</Tabs>
+
+## Who should use which component
+
+| Audience | Recommended entry point | Why |
+|---|---|---|
+| **Framework developers** embedding Megatron into a larger system (NeMo, custom trainer) | Megatron Core | Composable APIs, no training-script dependencies |
+| **ML engineers** building production pipelines | Megatron Core | Modular components, fault tolerance, FSDP support |
+| **Research teams** exploring new architectures or training techniques | Megatron-LM | Pre-wired scripts, fast iteration, full examples |
+| **Learning distributed training** | Megatron-LM | Best-practice configs, documented reference patterns |
+| **Quick experimentation** on known architectures | Megatron-LM | Zero boilerplate, proven configurations |
+
+## Project structure
+
+```
+Megatron-LM/
+├── megatron/
+│   ├── core/                    # Megatron Core (library)
+│   │   ├── models/              # GPT, LLaMA, Mixtral, Mamba, multimodal
+│   │   ├── transformer/         # Attention, MLP, LayerNorm building blocks
+│   │   ├── tensor_parallel/     # Tensor parallelism primitives
+│   │   ├── pipeline_parallel/   # Pipeline parallelism schedules
+│   │   ├── distributed/         # DDP, FSDP, distributed optimizer
+│   │   ├── optimizer/           # Adam, distributed optimizer
+│   │   ├── datasets/            # Dataset loaders and blending
+│   │   ├── inference/           # Inference engine and server
+│   │   └── export/              # TensorRT-LLM and other export paths
+│   ├── training/                # Megatron-LM training scripts and loops
+│   ├── legacy/                  # Legacy model components (GPT-2 era)
+│   ├── post_training/           # Quantization, distillation, pruning
+│   └── rl/                      # Reinforcement learning (RLHF, etc.)
+├── examples/                    # Ready-to-use end-to-end training examples
+│   ├── gpt3/
+│   ├── llama/
+│   ├── mixtral/
+│   └── post_training/
+├── tools/                       # Data preprocessing and conversion utilities
+├── tests/                       # Unit and integration test suite
+└── docs/                        # Documentation source
+```
+
+<Note>
+All Megatron Core source lives under `megatron/core/`. If you are writing code that imports from `megatron.core`, you are using Megatron Core. The `megatron/training/` directory and `pretrain_*.py` scripts at the root are part of Megatron-LM.
+</Note>
+
+## Megatron Core components in detail
+
+### Transformer building blocks (`megatron/core/transformer/`)
+
+The transformer module provides composable attention, MLP, and normalization layers that can be assembled into full model architectures. Each component is GPU-optimized and integrates with Transformer Engine for FP8 compute.
+
+```python
+from megatron.core.transformer import TransformerConfig, TransformerLayer
+from megatron.core.models.gpt import GPTModel
+
+config = TransformerConfig(
+    num_layers=32,
+    hidden_size=4096,
+    num_attention_heads=32,
+    use_cpu_initialization=False,
+    bf16=True,
+)
+model = GPTModel(config, vocab_size=131072, max_sequence_length=8192)
+```
+
+### Parallelism (`megatron/core/tensor_parallel/`, `megatron/core/pipeline_parallel/`)
+
+Parallelism primitives are encapsulated in `parallel_state`, which initializes process groups for TP, PP, DP, CP, and EP. A single `ModelParallelConfig` dataclass controls all parallelism degrees and their interactions.
+
+```python
+from megatron.core import parallel_state
+from megatron.core.model_parallel_config import ModelParallelConfig
+
+parallel_state.initialize_model_parallel(
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=4,
+    context_parallel_size=2,
+)
+```
+
+### Distributed optimizer (`megatron/core/distributed/`)
+
+The distributed optimizer shards optimizer states across data-parallel ranks, significantly reducing per-GPU memory. Megatron FSDP extends this to also shard gradients and parameters (ZeRO-1/2/3).
+
+### Datasets (`megatron/core/datasets/`)
+
+Megatron Core includes a high-performance indexed dataset format and blending utilities for mixing multiple data sources at configurable sampling ratios. For multimodal workloads, the Megatron Energon library provides text, image, video, and audio loading.
+
+### Inference (`megatron/core/inference/`)
+
+An inference engine and HTTP server for serving trained models, with support for dynamic batching and KV-cache management. Models can also be exported to TensorRT-LLM for optimized deployment.
+
+## Ecosystem
+
+Megatron Core sits at the center of a larger ecosystem:
+
+| Library | Role |
+|---|---|
+| **[Transformer Engine](https://github.com/NVIDIA/TransformerEngine)** | FP8 kernels and optimized attention used by Megatron Core internally |
+| **[Megatron Energon](https://github.com/NVIDIA/Megatron-Energon)** | Multimodal data loader (text, images, video, audio) |
+| **[NVRx](https://github.com/NVIDIA/nvidia-resiliency-ext)** | Fault-tolerant training with failure detection and automatic recovery |
+| **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** | Bidirectional Hugging Face ↔ Megatron checkpoint conversion |
+| **[NeMo Framework](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html)** | Enterprise training framework built on Megatron Core |
+| **[NeMo RL](https://github.com/NVIDIA-NeMo/RL)** | Post-training with RLHF, DPO, and other alignment methods |
+| **[ModelOpt](https://github.com/NVIDIA/Model-Optimizer)** | Quantization, pruning, distillation, and speculative decoding |

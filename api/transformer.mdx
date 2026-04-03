@@ -1,0 +1,278 @@
+---
+title: "Transformer Building Blocks"
+description: "TransformerConfig, TransformerBlock, and attention types — the foundational components for building Megatron-LM models."
+---
+
+The `megatron.core.transformer` package contains the configuration dataclass, the layer stack, and attention primitives that all built-in models are constructed from.
+
+## TransformerConfig
+
+`megatron.core.transformer.transformer_config.TransformerConfig`
+
+`TransformerConfig` is a dataclass that extends `ModelParallelConfig`. It is the single configuration object passed to every model and transformer-layer constructor. Instantiate it directly:
+
+```python
+from megatron.core.transformer.transformer_config import TransformerConfig
+import torch
+
+config = TransformerConfig(
+    # Architecture
+    num_layers=32,
+    hidden_size=4096,
+    num_attention_heads=32,
+    num_query_groups=8,        # GQA: 8 key-value heads
+    ffn_hidden_size=11008,
+    normalization='RMSNorm',
+    # Parallelism (inherited from ModelParallelConfig)
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=2,
+    # Training precision
+    bf16=True,
+    params_dtype=torch.bfloat16,
+)
+```
+
+### Architecture parameters
+
+<ParamField path="num_layers" type="int" required>
+  Number of transformer layers in a transformer block. Must be divisible by `pipeline_model_parallel_size` (unless `num_layers_in_first_pipeline_stage` / `num_layers_in_last_pipeline_stage` are set).
+</ParamField>
+
+<ParamField path="hidden_size" type="int" required>
+  Model hidden dimension. All projection weight shapes are derived from this.
+</ParamField>
+
+<ParamField path="num_attention_heads" type="int" required>
+  Total number of attention heads. The per-head dimension is `hidden_size // num_attention_heads`.
+</ParamField>
+
+<ParamField path="num_query_groups" type="Optional[int]" default="None">
+  Number of key-value head groups for Grouped Query Attention (GQA). When `None` or equal to `num_attention_heads`, standard multi-head attention is used. Set to `1` for Multi-Query Attention (MQA).
+</ParamField>
+
+<ParamField path="ffn_hidden_size" type="Optional[int]" default="None">
+  Feed-forward network inner dimension. Defaults to `4 * hidden_size` when `None`.
+</ParamField>
+
+<ParamField path="kv_channels" type="Optional[int]" default="None">
+  Per-head key/value projection dimension. Defaults to `hidden_size // num_attention_heads`.
+</ParamField>
+
+<ParamField path="normalization" type="Literal['LayerNorm', 'RMSNorm']" default="'LayerNorm'">
+  Normalization layer type applied before/after attention and MLP sub-layers.
+</ParamField>
+
+<ParamField path="layernorm_epsilon" type="float" default="1e-5">
+  Epsilon for numerical stability in LayerNorm / RMSNorm.
+</ParamField>
+
+<ParamField path="layernorm_zero_centered_gamma" type="bool" default="False">
+  Shift the LayerNorm `gamma` parameter so that it is initialized at zero rather than one. Improves numerical stability at scale.
+</ParamField>
+
+<ParamField path="gated_linear_unit" type="bool" default="False">
+  Use a gated linear unit (SwiGLU / GeGLU style) for the first FFN linear layer instead of a plain linear.
+</ParamField>
+
+<ParamField path="activation_func" type="Callable[[Tensor], Tensor]" default="F.gelu">
+  Activation function for the MLP non-linearity. Common choices: `F.gelu`, `F.silu`, `quick_gelu`.
+</ParamField>
+
+<ParamField path="add_bias_linear" type="bool" default="True">
+  Add a bias term to all linear projections (QKV, output, MLP). Set to `False` for LLaMA-style models.
+</ParamField>
+
+<ParamField path="add_qkv_bias" type="bool" default="False">
+  Add bias only to the QKV projections, overriding `add_bias_linear` for those layers.
+</ParamField>
+
+<ParamField path="hidden_dropout" type="float" default="0.1">
+  Dropout probability applied to the transformer hidden state after each sub-layer.
+</ParamField>
+
+<ParamField path="attention_dropout" type="float" default="0.1">
+  Dropout probability applied to attention weights.
+</ParamField>
+
+<ParamField path="fp32_residual_connection" type="bool" default="False">
+  Upcast residual connections to fp32 for improved training stability with mixed-precision.
+</ParamField>
+
+<ParamField path="apply_residual_connection_post_layernorm" type="bool" default="False">
+  If `True`, uses the pre-norm variant where the residual is added after the layer norm (original BERT ordering). Default is pre-norm (residual added before).
+</ParamField>
+
+<ParamField path="window_size" type="Optional[Tuple[int, int]]" default="None">
+  Sliding window attention sizes as `(left_context, right_context)`. Use `-1` for an infinite window in either direction. When `None`, full attention is used.
+</ParamField>
+
+<ParamField path="qk_layernorm" type="bool" default="False">
+  Apply layer normalization (of type `normalization`) to the query and key embeddings before computing attention scores.
+</ParamField>
+
+<ParamField path="rotary_interleaved" type="bool" default="False">
+  RoPE rotation style. `False` = rotate first-half / second-half (LLaMA style). `True` = rotate even/odd dimensions (RoFormer style).
+</ParamField>
+
+<ParamField path="num_moe_experts" type="Optional[int]" default="None">
+  When set, replaces the dense FFN with a Mixture-of-Experts (MoE) layer with this many experts.
+</ParamField>
+
+<ParamField path="attention_backend" type="AttnBackend" default="AttnBackend.auto">
+  Attention kernel backend. `auto` lets Transformer Engine choose the best available backend. `local` forces the pure-PyTorch Megatron implementation.
+</ParamField>
+
+<ParamField path="softmax_scale" type="Optional[float]" default="None">
+  Manual override for the attention softmax scale factor. Defaults to `1 / sqrt(kv_channels)`.
+</ParamField>
+
+### Multi-Token Prediction (MTP)
+
+<ParamField path="mtp_num_layers" type="Optional[int]" default="None">
+  Number of Multi-Token Prediction layers. When set, the model predicts `mtp_num_layers` additional future tokens at each position.
+</ParamField>
+
+<ParamField path="mtp_loss_scaling_factor" type="Optional[float]" default="0.1">
+  Weight applied to the aggregate MTP loss before adding it to the primary language modeling loss.
+</ParamField>
+
+<ParamField path="mtp_use_repeated_layer" type="bool" default="False">
+  Reuse a single MTP layer for all `mtp_num_layers` predictions instead of having separate parameters per layer.
+</ParamField>
+
+---
+
+## TransformerBlock
+
+`megatron.core.transformer.transformer_block.TransformerBlock`
+
+`TransformerBlock` is a `torch.nn.Module` containing the full stack of transformer layers for a single pipeline stage. It is constructed automatically by `GPTModel` and `BertModel`, but can be used directly when building custom architectures.
+
+```python
+from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
+from megatron.core.transformer.spec_utils import ModuleSpec
+
+# Determine how many layers this pipeline stage owns
+num_layers = get_num_layers_to_build(config)
+
+block = TransformerBlock(
+    config=config,
+    spec=layer_spec,        # ModuleSpec for each TransformerLayer
+    pre_process=True,       # this stage owns the input embedding
+    post_process=False,     # not the last stage
+)
+```
+
+### Constructor parameters
+
+<ParamField path="config" type="TransformerConfig" required>
+  Full transformer + parallelism configuration.
+</ParamField>
+
+<ParamField path="spec" type="ModuleSpec" required>
+  A `ModuleSpec` describing which submodule classes to use for each `TransformerLayer` (attention implementation, MLP, norms, etc.).
+</ParamField>
+
+<ParamField path="pre_process" type="bool" default="True">
+  Whether this block is on the first pipeline stage (owns the embedding layer output normalization).
+</ParamField>
+
+<ParamField path="post_process" type="bool" default="True">
+  Whether this block is on the last pipeline stage (applies final layer norm).
+</ParamField>
+
+### Helper function: `get_num_layers_to_build`
+
+```python
+def get_num_layers_to_build(
+    config: TransformerConfig,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+) -> int:
+```
+
+Returns the number of transformer layers that the current pipeline rank should build, accounting for custom pipeline layouts (`config.pipeline_model_parallel_layout`), unequal first/last stage sizes, and virtual pipeline stages.
+
+---
+
+## Attention types
+
+Megatron-LM supports several attention mechanisms, selected via `ModuleSpec` and `TransformerConfig` fields.
+
+### Self-attention (default)
+
+Standard multi-head self-attention. Enabled when `num_query_groups` equals `num_attention_heads` (or is `None`). The attention kernel is selected by `config.attention_backend`.
+
+```python
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+config = TransformerConfig(
+    num_layers=12,
+    hidden_size=768,
+    num_attention_heads=12,
+    attention_backend=AttnBackend.auto,  # let TE pick Flash / fused / local
+)
+```
+
+### Grouped Query Attention (GQA / MQA)
+
+Set `num_query_groups < num_attention_heads` to activate GQA. Set `num_query_groups=1` for MQA.
+
+```python
+config = TransformerConfig(
+    num_layers=32,
+    hidden_size=4096,
+    num_attention_heads=32,
+    num_query_groups=8,   # 8 KV heads, 32 Q heads → GQA
+)
+```
+
+### Cross-attention
+
+Used in encoder-decoder architectures (e.g., T5). Activated by including `CrossAttentionSubmodules` in the `ModuleSpec` for the decoder layer.
+
+### Sliding window attention
+
+Enabled via `config.window_size`:
+
+```python
+config = TransformerConfig(
+    num_layers=32,
+    hidden_size=4096,
+    num_attention_heads=32,
+    window_size=(4096, 0),   # 4096-token left context, causal (no right)
+    window_attn_skip_freq=4, # full attention every 4th layer
+)
+```
+
+### Multi-Latent Attention (MLA)
+
+NVIDIA's memory-efficient attention variant that compresses KV projections into a low-rank latent space. Activated by using the MLA-specific `ModuleSpec` entries from `megatron.core.transformer.multi_latent_attention`.
+
+<Note>
+The attention backend (`AttnBackend.auto`, `AttnBackend.local`, etc.) controls the CUDA kernel used for dot-product computation but does not change the attention *type* (self, cross, sliding window). These are orthogonal configuration axes.
+</Note>
+
+---
+
+## ModuleSpec
+
+`megatron.core.transformer.spec_utils.ModuleSpec`
+
+A lightweight descriptor that specifies which Python class to instantiate for a given module slot and what keyword arguments to pass. Used throughout the codebase to decouple the model graph from specific implementations (pure PyTorch vs. Transformer Engine kernels).
+
+```python
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.dot_product_attention import DotProductAttention
+
+attn_spec = ModuleSpec(
+    module=SelfAttention,
+    submodules=SelfAttentionSubmodules(
+        core_attention=DotProductAttention,
+    ),
+)
+```
+
+Pre-built specs for GPT and BERT are available in `megatron.core.models.gpt.gpt_layer_specs` and `megatron.core.models.bert.bert_layer_specs`.

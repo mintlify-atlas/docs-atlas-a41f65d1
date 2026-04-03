@@ -1,0 +1,196 @@
+---
+title: "Contributing"
+description: "How to contribute to Megatron-LM: bug reports, feature requests, pull requests, and documentation."
+keywords: ["contributing", "pull request", "development setup", "code style", "pre-commit"]
+---
+
+Everyone is welcome to contribute to Megatron-LM. The project recently migrated from an internal repository to doing all development directly on GitHub.
+
+When contributing, ensure your changes align with the project direction. Small bug fixes are welcomed without prior discussion. For large architectural changes or stylistic refactors, open an issue first to discuss the approach with the team.
+
+## Ways to contribute
+
+- **Bug reports** — File issues using the BUG template when something doesn't work as expected.
+- **Regression reports** — Use the REGRESSION template if you find a speed or accuracy regression.
+- **Feature requests** — Use the ENHANCEMENT template to propose new or modified functionality.
+- **Pull requests** — Submit code fixes, new features, or documentation improvements.
+- **Documentation** — Improve examples, fix errors, or expand explanations.
+
+## Issue guidelines
+
+- Use the appropriate issue template (BUG, REGRESSION, ENHANCEMENT).
+- One issue per bug — combining multiple problems makes triage and resolution harder.
+- Make bugs reproducible — issues the team can reproduce get attention faster.
+- Write clearly using proper spelling, grammar, and punctuation.
+- Use a technical and authoritative tone.
+- For questions, no template is needed, but keep the question concise.
+
+## Development setup
+
+<Steps>
+  <Step title="Fork and clone the repository">
+    Always push branches to your personal fork, not directly to the upstream repository. Open PRs from your fork's branch against `NVIDIA/Megatron-LM`.
+
+    ```bash
+    git clone https://github.com/<your-username>/Megatron-LM.git
+    cd Megatron-LM
+    git remote add upstream https://github.com/NVIDIA/Megatron-LM.git
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    The project uses [uv](https://docs.astral.sh/uv/) for dependency management. Install the package in editable mode with development dependencies:
+
+    ```bash
+    uv pip install -e ".[dev]"
+    ```
+
+    This installs the core package along with all linting, testing, and optional training dependencies. The `dev` extra includes Transformer Engine, nvidia-resiliency-ext, Megatron Energon, and other optional components.
+  </Step>
+
+  <Step title="Install pre-commit hooks">
+    Pre-commit hooks enforce code style automatically before each commit:
+
+    ```bash
+    uv run pre-commit install
+    ```
+
+    Hooks run black, pylint, and isort on the relevant files on every `git commit`.
+  </Step>
+
+  <Step title="Create a branch and make your changes">
+    Branch off `main` and keep your changes focused on a single concern:
+
+    ```bash
+    git checkout -b my-feature-branch
+    ```
+
+    After editing any Python files with import changes, run isort to fix import order:
+
+    ```bash
+    uv run isort <path/to/file.py>
+    ```
+  </Step>
+
+  <Step title="Open a draft PR">
+    All PRs must start as drafts. Use the GitHub UI or the CLI:
+
+    ```bash
+    gh pr create --draft --title "Your PR title" --body "Description of your changes"
+    ```
+
+    <Note>
+      Never push branches directly to `https://github.com/NVIDIA/Megatron-LM`. Always push to your personal fork and open a PR from there.
+    </Note>
+  </Step>
+</Steps>
+
+## Code style
+
+Megatron-LM enforces consistent code style across `megatron/core/` and `tests/unit_tests/` using the following tools:
+
+| Tool | Version | Scope |
+|------|---------|-------|
+| [black](https://black.readthedocs.io/) | 24.4.2 | `megatron/core/`, `tests/unit_tests/` |
+| [isort](https://pycqa.github.io/isort/) | 5.13.2 | `megatron/core/` |
+| [pylint](https://pylint.readthedocs.io/) | 3.2.6 | `megatron/core/` |
+| [ruff](https://docs.astral.sh/ruff/) | ~0.9.0 | Project-wide |
+| [flake8](https://flake8.pycqa.org/) | 7.1.0 | Available in linting group |
+
+Key style rules:
+
+- **Line length**: 100 characters (black and isort both configured to match).
+- **String normalization**: disabled (single quotes are allowed).
+- **Import order**: black-compatible isort profile with `megatron` as a first-party package.
+- **Docstrings**: Google convention enforced by ruff's pydocstyle rules.
+
+Run the linters manually:
+
+<CodeGroup>
+
+```bash black
+uv run black megatron/core/
+```
+
+```bash isort
+uv run isort megatron/core/
+```
+
+```bash pylint
+uv run pylint megatron/core/
+```
+
+```bash ruff
+uv run ruff check megatron/core/
+```
+
+</CodeGroup>
+
+## Pre-commit hooks
+
+The `.pre-commit-config.yaml` configures three hooks that run automatically on `git commit`:
+
+- **black** — Formats Python files in `megatron/core/` and `tests/unit_tests/`.
+- **pylint** — Lints Python files in `megatron/core/`.
+- **isort** — Sorts imports in `megatron/core/`.
+
+To run all hooks manually against staged files:
+
+```bash
+uv run pre-commit run
+```
+
+To run against all files in the repository:
+
+```bash
+uv run pre-commit run --all-files
+```
+
+## Commit message conventions
+
+- Write the subject line in the **imperative mood**: "Fix the default argument for X", not "Fixed the default argument for X".
+- Keep commits **atomic** — one commit per feature or fix.
+- Rebase your branch on `main` before marking the PR ready for review.
+- Check spelling in code, comments, and commit messages.
+- Do not include commented-out code.
+- Do not touch code outside the stated scope of the PR (including unrelated formatting changes).
+
+## PR workflow
+
+<Steps>
+  <Step title="Resolve conflicts and pass CI">
+    Before marking your PR ready, ensure all merge conflicts are resolved and CI is passing. Marking as ready with a failing CI may result in the final review being declined.
+  </Step>
+
+  <Step title="Mark as ready for review">
+    Click **Ready for Review** in the GitHub UI. The on-call reviewer (`@mcore-oncall`) is auto-assigned and expert reviewers are notified based on the files you changed.
+  </Step>
+
+  <Step title="Expert review (megatron/core changes only)">
+    For PRs that modify `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied automatically and final reviewers are assigned. PRs outside `megatron/core` skip this step.
+  </Step>
+
+  <Step title="Approval">
+    Once all required reviewers have approved, the `Approved` label is applied automatically. The PR is now ready to merge.
+  </Step>
+
+  <Step title="Merge">
+    Any member of [mcore-engineers](https://github.com/orgs/NVIDIA/teams/mcore-engineers) can merge the approved PR.
+  </Step>
+</Steps>
+
+## Response times
+
+- Expect a response within **2 business days** of opening an issue or PR.
+- If you haven't heard back after 2 business days, tag [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall).
+- PRs with no activity for **60 days** are automatically marked as stale by a bot.
+
+## API backwards compatibility policy
+
+Changes to `megatron/core` go through a two-stage review (expert review followed by final review) precisely because the public API must remain stable for downstream consumers such as NeMo, Megatron Bridge, and Model Optimizer.
+
+<Tip>
+  If you are proposing a breaking change to a public API in `megatron/core`, open an issue first to discuss the migration path before writing any code.
+</Tip>
+
+When adding new public symbols, follow the existing patterns for module-level `__all__` exports and include docstrings in Google convention format.

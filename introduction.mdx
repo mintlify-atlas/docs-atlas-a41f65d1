@@ -1,0 +1,99 @@
+---
+title: "Introduction"
+description: "GPU-optimized library for training transformer models at scale across thousands of GPUs."
+---
+
+Megatron-LM is an open-source repository that contains two distinct but complementary components: **Megatron Core** and **Megatron-LM**. Together they cover everything from low-level GPU-optimized building blocks to full end-to-end training pipelines for large language models.
+
+## Two Components, One Repository
+
+<CardGroup cols={2}>
+  <Card title="Megatron Core" icon="cube">
+    A **composable library** of GPU-optimized building blocks for custom training frameworks. Provides transformer primitives, advanced parallelism strategies, and mixed precision support as modular, reusable APIs.
+
+    **Best for:** Framework developers, ML engineers building custom training pipelines, and research teams that need precise control over the training loop.
+  </Card>
+  <Card title="Megatron-LM" icon="rocket">
+    A **reference implementation** that bundles Megatron Core with pre-configured training scripts, data pipelines, and end-to-end examples for popular architectures including GPT, LLaMA, DeepSeek, and Qwen.
+
+    **Best for:** Training large foundation models at scale, exploring new architectures, learning distributed training concepts, and quick experimentation.
+  </Card>
+</CardGroup>
+
+<Note>
+  Both components live in the same repository. When you install `megatron-core` from PyPI you get the library. When you clone the full repo you get both the library and the reference scripts.
+</Note>
+
+## Megatron Core
+
+Megatron Core is the engine underneath everything. It provides GPU-optimized techniques through composable and modular APIs, enabling training at the multi-billion to trillion-parameter scale across thousands of GPUs.
+
+**Key capabilities:**
+
+- **Advanced parallelism** — Tensor Parallelism (TP), Pipeline Parallelism (PP), Data Parallelism (DP), Expert Parallelism (EP), and Context Parallelism (CP)
+- **Mixed precision** — FP16, BF16, FP8, and FP4 training (FP8/FP4 require Hopper, Ada, or Blackwell GPUs)
+- **Transformer building blocks** — Composable attention, MLP, and normalization layers
+- **Distributed optimizer** — Sharded optimizer states with overlap of gradient reduction and parameter gather
+- **Model architectures** — LLaMA, Qwen, GPT, Mixtral MoE, Mamba, and more
+- **High-performance data loading** — GPU-aware binary datasets and multi-modal data via Megatron Energon
+- **Distributed checkpointing** — Topology-agnostic save/load that works across parallelism configurations
+- **Fault tolerance** — Integration with NVRx for failure detection and automatic recovery
+
+Megatron Core is compatible with all NVIDIA Tensor Core GPUs and has been benchmarked at up to **47% Model FLOP Utilization (MFU)** on 6,144 H100 GPUs training a 462B parameter model.
+
+## Megatron-LM
+
+Megatron-LM is the direct entry point for exploring Megatron Core. It wraps the library with a customizable native PyTorch training loop (via `pretrain_gpt.py`) and ships with ready-to-use scripts for popular models.
+
+**What you get:**
+
+- Pre-configured training scripts for GPT, LLaMA 3, DeepSeek, Qwen, and more
+- End-to-end examples from data preprocessing to evaluation
+- Lightweight abstraction — fewer layers between you and the raw training loop
+- Research-focused utilities and profiling hooks
+
+## Megatron Bridge
+
+[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) sits alongside these two components and solves the interoperability problem: moving models between the Megatron world and the broader ecosystem.
+
+It provides a **parallelism-aware bidirectional converter** that performs on-the-fly, model-parallel-aware, per-parameter conversion with full in-memory loading. This means you can:
+
+- Load a Hugging Face checkpoint and immediately continue training in Megatron
+- Export a trained Megatron model back to Hugging Face format for deployment or sharing
+- Use production-ready training recipes for popular model families
+
+<Tip>
+  If you are coming from Hugging Face and want to fine-tune or continue pretraining a model, Megatron Bridge is the fastest path to getting started.
+</Tip>
+
+## Ecosystem
+
+Megatron Core integrates with a curated set of libraries:
+
+| Library | Role |
+|---|---|
+| [Transformer Engine](https://github.com/NVIDIA/TransformerEngine) | FP8 kernels and mixed precision support |
+| [Megatron Energon](https://github.com/NVIDIA/Megatron-Energon) | Multi-modal data loading (text, images, video, audio) |
+| [NVRx](https://github.com/NVIDIA/nvidia-resiliency-ext) | Fault tolerant training with failure detection and recovery |
+| [NeMo RL](https://github.com/NVIDIA-NeMo/RL) | RLHF, DPO, and post-training at scale |
+| [NeMo Framework](https://docs.nvidia.com/nemo-framework/user-guide/latest/overview.html) | Enterprise cloud-native training framework |
+| [ModelOpt](https://github.com/NVIDIA/Model-Optimizer) | Quantization, pruning, distillation, and speculative decoding |
+
+Megatron Core is also compatible with [Hugging Face Accelerate](https://github.com/huggingface/accelerate), [Colossal-AI](https://github.com/hpcaitech/ColossalAI), and [DeepSpeed](https://github.com/microsoft/DeepSpeed).
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/get-started/installation">
+    Install Megatron Core from PyPI, from source, or use the pre-configured NGC container.
+  </Card>
+  <Card title="Your First Training Run" icon="play" href="/get-started/quickstart">
+    Run a minimal 2-GPU training loop, then scale up to a full LLaMA-3 8B FP8 training job.
+  </Card>
+  <Card title="Parallelism Strategies" icon="diagram-project" href="/concepts/parallelism">
+    Learn how to combine TP, PP, DP, EP, and CP to scale across your GPU cluster.
+  </Card>
+  <Card title="Data Preparation" icon="database" href="/training/data-preparation">
+    Convert raw text into the binary format Megatron expects for high-throughput training.
+  </Card>
+</CardGroup>

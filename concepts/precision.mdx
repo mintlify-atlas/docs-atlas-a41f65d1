@@ -1,0 +1,216 @@
+---
+title: 'Mixed precision training'
+description: 'Configure FP32, BF16, FP16, FP8, and FP4 precision modes in Megatron Core for optimal training throughput and memory efficiency.'
+keywords: ['mixed precision', 'bf16', 'fp16', 'fp8', 'fp4', 'transformer engine', 'quantization', 'loss scaling']
+---
+
+Megatron Core supports a range of floating-point precision modes, from full FP32 to FP4. Lower precision formats reduce memory consumption and accelerate matrix multiplications on NVIDIA Tensor Core hardware, at the cost of reduced numerical range or precision.
+
+## Precision modes at a glance
+
+| Format | Parameter storage | Compute | Hardware | Memory vs FP32 |
+|---|---|---|---|---|
+| FP32 | 32-bit float | 32-bit | All GPUs | 1× (baseline) |
+| BF16 | BF16 main weights in FP32 | BF16 GEMMs | Ampere+ (A100, H100) | ~0.5× |
+| FP16 | FP16 main weights in FP32 | FP16 GEMMs | Volta+ (V100, A100) | ~0.5× |
+| FP8 | FP8 + FP32 master weights | FP8 GEMMs | Hopper+ (H100) | ~0.25× |
+| FP4 | FP4 + FP32 master weights | FP4 GEMMs | Blackwell (B100, B200) | ~0.125× |
+
+---
+
+## FP32 (full precision)
+
+Full 32-bit floating-point training. All weights, gradients, and activations use FP32. No precision flags needed—this is the default.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --num-layers 32 \
+    --hidden-size 4096
+    # No --bf16 or --fp16 flag → FP32 by default
+```
+
+**When to use FP32:**
+- Debugging numerical issues (reference baseline)
+- Very small models where memory is not a concern
+- Validating correctness of a new architecture before switching to lower precision
+
+<Note>
+FP32 training is rarely used for large models in practice. BF16 is almost always preferable: it has the same exponent range as FP32, trains stably without loss scaling, and roughly halves memory consumption.
+</Note>
+
+---
+
+## BF16 (brain float 16)
+
+BF16 uses 16 bits with the same 8-bit exponent range as FP32 but only 7 mantissa bits (vs. 23 in FP32). The matched exponent range means BF16 does not suffer from gradient overflow and requires no loss scaling.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --num-layers 80 \
+    --hidden-size 8192 \
+    --bf16
+```
+
+Internally, BF16 training keeps FP32 master weights (the `params_dtype` default). GEMMs execute in BF16; the optimizer accumulates in FP32.
+
+**When to use BF16:**
+- Default choice for Ampere (A100) and Hopper (H100) GPUs
+- Any large-scale training run where numerical stability matters
+- When you want the simplest mixed-precision setup with no tuning required
+
+<Tip>
+BF16 is the recommended default for all new training runs on A100 and H100 hardware. It delivers ~2× throughput improvement over FP32 and trains stably without loss scaling across virtually all model architectures.
+</Tip>
+
+---
+
+## FP16 (half precision)
+
+FP16 uses 16 bits with a 5-bit exponent and 10-bit mantissa. The narrower exponent range (max ≈ 65504) means large gradient values overflow to infinity. Loss scaling is mandatory.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --num-layers 32 \
+    --hidden-size 4096 \
+    --fp16 \
+    --initial-loss-scale 65536 \
+    --min-loss-scale 1.0
+```
+
+Megatron Core manages dynamic loss scaling automatically when `--fp16` is set. The scaler increases the loss scale when no overflows occur and decreases it after an overflow is detected.
+
+**When to use FP16:**
+- Volta-era GPUs (V100) that do not support BF16
+- Models or libraries that are specifically optimized for FP16 (some legacy checkpoints)
+- When interoperability with FP16-only tooling is required
+
+<Warning>
+FP16 requires careful loss scale tuning. Gradient overflow produces NaN losses and can corrupt checkpoints. On Ampere and later hardware, prefer BF16 which has no overflow risk.
+</Warning>
+
+---
+
+## FP8 (Transformer Engine)
+
+FP8 training reduces the compute precision of large matrix multiplications (GEMMs inside attention and MLP layers) to 8-bit float using NVIDIA Transformer Engine. Two FP8 formats are used: E4M3 (higher precision, smaller range) for forward-pass weights and activations, and E5M2 (wider range) for gradients.
+
+Megatron Core integrates with Transformer Engine automatically when `--fp8-format` is set. Transformer Engine manages per-tensor scaling factors that keep values in the representable FP8 range.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --num-layers 80 \
+    --hidden-size 8192 \
+    --bf16 \
+    --fp8-format hybrid \
+    --fp8-amax-history-len 1024 \
+    --fp8-amax-compute-algo max
+```
+
+### FP8 format options
+
+| Format | Forward (weights/activations) | Backward (gradients) | Notes |
+|---|---|---|---|
+| `hybrid` | E4M3 | E5M2 | Recommended for most models |
+| `e4m3` | E4M3 | E4M3 | Higher precision, may diverge on some models |
+| `e5m2` | E5M2 | E5M2 | Widest range, lowest precision |
+
+### FP8 scaling configuration
+
+```bash
+# Amax history controls how many steps are used to compute the scaling factor
+--fp8-amax-history-len 1024
+
+# Amax compute algorithm: 'max' or 'most_recent'
+--fp8-amax-compute-algo max
+```
+
+**When to use FP8:**
+- Hopper (H100) and later GPUs with native FP8 hardware support
+- Large models where compute is the bottleneck (not memory bandwidth)
+- Production training runs where throughput is the primary concern
+
+<Note>
+FP8 requires Transformer Engine (TE >= 1.1) and Megatron Core >= 0.5.0. It is not supported on Ampere (A100) or earlier hardware.
+</Note>
+
+<Tip>
+The `hybrid` format (E4M3 forward, E5M2 backward) is the standard recommendation. It provides the best balance of numerical stability and throughput for most transformer architectures. Start with `hybrid` before experimenting with other formats.
+</Tip>
+
+---
+
+## FP4
+
+FP4 further reduces precision to 4 bits per value for matrix multiplications, targeting NVIDIA Blackwell (B100, B200) hardware. FP4 roughly halves memory consumption compared to FP8 and doubles the theoretical peak GEMM throughput.
+
+```bash
+# FP4 support is provided via Transformer Engine on Blackwell hardware
+--fp8-format hybrid \
+--fp4-format e2m1   # Blackwell FP4 format
+```
+
+**When to use FP4:**
+- Blackwell (B100, B200) GPUs only
+- Maximum throughput on extremely large models
+- Workloads where the slight precision reduction is acceptable after validation
+
+<Warning>
+FP4 is an emerging format. Validate model quality carefully before deploying FP4-trained checkpoints. Not all layer types support FP4; Transformer Engine falls back to BF16 for unsupported operations.
+</Warning>
+
+---
+
+## Memory savings reference
+
+The following estimates are for a model with 7B parameters. Actual savings depend on batch size, sequence length, and optimizer configuration.
+
+| Precision | Param memory | Gradient memory | Optimizer (Adam) | Total (approx.) |
+|---|---|---|---|---|
+| FP32 | 28 GB | 28 GB | 56 GB | ~112 GB |
+| BF16 / FP16 | 14 GB | 14 GB | 56 GB (FP32 optimizer) | ~84 GB |
+| FP8 | 7 GB | 14 GB | 56 GB (FP32 optimizer) | ~77 GB |
+| FP8 + FSDP (ZeRO-3, 8 GPUs) | ~1 GB/GPU | ~2 GB/GPU | ~7 GB/GPU | ~10 GB/GPU |
+
+<Note>
+Optimizer state memory dominates at lower precision because Adam keeps FP32 master copies of all parameters and two FP32 momentum buffers. Use FSDP (`--use-megatron-fsdp --data-parallel-sharding-strategy optim`) to distribute this cost across GPUs.
+</Note>
+
+---
+
+## Combining precision with parallelism
+
+Precision mode interacts with parallelism configuration. The `ModelParallelConfig` dataclass captures both:
+
+```python
+from megatron.core.model_parallel_config import ModelParallelConfig
+import torch
+
+config = ModelParallelConfig(
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=4,
+    bf16=True,                        # BF16 training
+    params_dtype=torch.bfloat16,      # Weight dtype
+    pipeline_dtype=torch.bfloat16,    # Activation dtype in P2P communication
+)
+```
+
+For FP8, Transformer Engine handles the precision internally; you still set `--bf16` in the training script alongside the FP8 flags—BF16 applies to operations not covered by FP8 (LayerNorm, embedding, output projection).
+
+---
+
+## Choosing a precision mode
+
+```
+Are you on H100 or newer?
+├── Yes → Start with BF16, then enable FP8 (hybrid) for more throughput
+└── No → Are you on A100?
+    ├── Yes → Use BF16
+    └── No (V100 or older) → Use FP16 with loss scaling
+
+Is memory the primary constraint?
+├── Yes → Combine FP8 with FSDP ZeRO-3 (--use-megatron-fsdp --data-parallel-sharding-strategy optim_grads_params)
+└── No → BF16 is sufficient for most training runs
+
+Are you debugging a training instability?
+└── Yes → Switch to FP32 temporarily to establish a numerical reference
+```

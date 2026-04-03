@@ -1,0 +1,246 @@
+---
+title: "Data Preparation"
+description: "Prepare and preprocess training data for Megatron-LM using the binary indexed dataset format."
+---
+
+Megatron-LM uses a high-performance binary dataset format for training. Raw text data must be tokenized and converted into `.bin`/`.idx` file pairs before training begins. The `tools/preprocess_data.py` script handles this conversion.
+
+## Data Format
+
+Megatron-LM expects raw training data in **JSONL** (JSON Lines) format. Each line is a self-contained JSON object with a `text` field (or any key you specify with `--json-keys`):
+
+```json
+{"text": "Your training text here..."}
+{"text": "Another training sample..."}
+{"text": "More training data..."}
+```
+
+Each line represents one document. The preprocessor tokenizes each document independently and appends an end-of-document token when `--append-eod` is set.
+
+## Preprocessing Workflow
+
+<Steps>
+  <Step title="Prepare your JSONL file">
+    Collect your training corpus into a JSONL file where each line contains a JSON object with a `text` key. Ensure the file is UTF-8 encoded.
+
+    ```json
+    {"text": "First document text."}
+    {"text": "Second document text."}
+    ```
+  </Step>
+
+  <Step title="Choose a tokenizer">
+    Select the tokenizer that matches your model architecture. Megatron-LM supports several tokenizer types — see the [Tokenizer Options](#tokenizer-options) section below.
+
+    For LLaMA-family models, use `HuggingFaceTokenizer` with the model's tokenizer files. For GPT-2-style models, use `GPT2BPETokenizer` with the standard vocab and merge files.
+  </Step>
+
+  <Step title="Run preprocess_data.py">
+    Convert your JSONL file to Megatron's binary format:
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix my_dataset \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --workers 8 \
+        --append-eod
+    ```
+
+    This produces two files:
+    - `my_dataset_text_document.bin` — tokenized sequences in binary format
+    - `my_dataset_text_document.idx` — index for fast random access
+  </Step>
+
+  <Step title="Reference the dataset in training">
+    Pass the output prefix (without extension) to your training script:
+
+    ```bash
+    --data-path my_dataset_text_document \
+    --split 949,50,1
+    ```
+
+    The `--split` argument sets the train/validation/test split as comma-separated percentages.
+  </Step>
+</Steps>
+
+## preprocess_data.py Arguments
+
+| Argument | Required | Description |
+|---|---|---|
+| `--input` | Yes | Path to input JSONL (or JSON) file |
+| `--output-prefix` | Yes | Prefix for output `.bin` and `.idx` files |
+| `--tokenizer-type` | Yes | Tokenizer type: `HuggingFaceTokenizer`, `GPT2BPETokenizer`, `SentencePieceTokenizer`, `BertWordPieceCase`, `BertWordPieceLowerCase`, `NullTokenizer` |
+| `--tokenizer-model` | Conditional | Path to tokenizer model file (required for `HuggingFaceTokenizer`, `SentencePieceTokenizer`) |
+| `--vocab-file` | Conditional | Path to vocabulary file (required for `GPT2BPETokenizer`, BERT tokenizers) |
+| `--merge-file` | Conditional | Path to BPE merge file (required for `GPT2BPETokenizer`) |
+| `--json-keys` | No | Space-separated list of JSON keys to extract (default: `text`) |
+| `--workers` | Yes | Number of parallel worker processes for tokenization |
+| `--append-eod` | No | Append end-of-document token after each document |
+| `--split-sentences` | No | Split documents into individual sentences using NLTK |
+| `--keep-newlines` | No | Preserve newlines between sentences when splitting |
+| `--lang` | No | Language for NLTK sentence splitting (default: `english`) |
+| `--partitions` | No | Number of file partitions for large datasets (default: `1`) |
+| `--log-interval` | No | Progress logging interval in documents (default: `1000`) |
+| `--keep-sequential-samples` | No | Preserve sample ordering when using `--partitions > 1` |
+| `--find-optimal-num-workers` | No | Benchmark different worker counts to find the fastest setting |
+| `--workers-to-check` | No | Worker counts to benchmark (default: `16 32 64`); requires `--find-optimal-num-workers` |
+| `--max-documents` | No | Documents per benchmark run (default: `100000`); requires `--find-optimal-num-workers` |
+
+## Tokenizer Options
+
+<Tabs>
+  <Tab title="HuggingFace">
+    Use any HuggingFace-compatible tokenizer. This is the recommended option for LLaMA, Mistral, Qwen, and other modern model families.
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix my_dataset \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --workers 8 \
+        --append-eod
+    ```
+  </Tab>
+  <Tab title="GPT-2 BPE">
+    Use the standard GPT-2 byte-pair encoding tokenizer. Requires the `gpt2-vocab.json` and `gpt2-merges.txt` files, which can be downloaded from the OpenAI GPT-2 release.
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix my_dataset \
+        --tokenizer-type GPT2BPETokenizer \
+        --vocab-file gpt2-vocab.json \
+        --merge-file gpt2-merges.txt \
+        --workers 8 \
+        --append-eod
+    ```
+  </Tab>
+  <Tab title="BERT WordPiece">
+    Use the BERT WordPiece tokenizer. Two variants are available: case-sensitive (`BertWordPieceCase`) and lowercased (`BertWordPieceLowerCase`).
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix my_dataset \
+        --tokenizer-type BertWordPieceLowerCase \
+        --vocab-file bert-vocab.txt \
+        --workers 8 \
+        --split-sentences
+    ```
+
+    <Note>
+      BERT training typically benefits from `--split-sentences` because the model is trained on sentence pairs. You will see a warning if you omit this flag with a BERT-type tokenizer.
+    </Note>
+  </Tab>
+  <Tab title="SentencePiece">
+    Use a SentencePiece model file directly:
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix my_dataset \
+        --tokenizer-type SentencePieceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --workers 8 \
+        --append-eod
+    ```
+  </Tab>
+</Tabs>
+
+## Output Files
+
+The preprocessor writes a pair of files for each JSON key extracted:
+
+```
+my_dataset_text_document.bin   # binary token IDs
+my_dataset_text_document.idx   # offset index for random access
+```
+
+The `.bin` file stores tokenized sequences packed end-to-end. The `.idx` file records document boundaries, enabling the dataset loader to seek directly to any document without scanning the full corpus.
+
+The binary dtype is chosen automatically based on vocabulary size (e.g., `uint16` for vocabularies up to 65535 tokens, `int32` for larger vocabularies).
+
+## Parallel Processing
+
+The `--workers` flag launches a multiprocessing pool for tokenization. A good starting point is the number of available CPU cores:
+
+```bash
+python tools/preprocess_data.py \
+    --input data.jsonl \
+    --output-prefix my_dataset \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --workers 16 \
+    --append-eod
+```
+
+<Tip>
+  Use `--find-optimal-num-workers` to automatically benchmark different worker counts against your specific hardware and dataset. The script runs several short preprocessing jobs and reports which setting achieved the highest throughput.
+</Tip>
+
+### Finding the Optimal Worker Count
+
+```bash
+python tools/preprocess_data.py \
+    --input data.jsonl \
+    --output-prefix my_dataset \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --workers 8 \
+    --find-optimal-num-workers \
+    --workers-to-check 4 8 16 32 \
+    --max-documents 50000
+```
+
+Example output:
+
+```
+-----------------------------------
+Performance results (fastest → slowest):
+1. 16 workers → avg. docs/s: 9606.6476
+2. 32 workers → avg. docs/s: 9275.3284
+3. 8 workers → avg. docs/s: 9151.9280
+4. 4 workers → avg. docs/s: 6391.3819
+
+-----------------------------------
+The most optimal num of workers is 16 with avg. preprocessed docs/s: 9606.6476.
+-----------------------------------
+```
+
+## Multi-Dataset Blending
+
+Megatron-LM supports blending multiple preprocessed datasets during training using weighted sampling. Pass a space-separated list of weight/path pairs to `--data-path`:
+
+```bash
+--data-path \
+    0.3 /data/books_text_document \
+    0.5 /data/web_text_document \
+    0.2 /data/code_text_document
+```
+
+Weights do not need to sum to 1.0 — they are normalized automatically. This allows mixing datasets of different sizes without pre-shuffling or concatenation.
+
+<Info>
+  When blending datasets, the `--split` flag (e.g., `949,50,1`) applies to each constituent dataset independently before blending occurs.
+</Info>
+
+## Large Dataset Partitioning
+
+For very large corpora, split the input into partitions to process in parallel and avoid memory pressure:
+
+```bash
+python tools/preprocess_data.py \
+    --input data.jsonl \
+    --output-prefix my_dataset \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --workers 16 \
+    --partitions 4 \
+    --keep-sequential-samples \
+    --append-eod
+```
+
+Each partition is saved as a separate file set. You can then reference all partitions in `--data-path` with equal weights for seamless blending.

@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Megatron-LM & Megatron Core",
+  "projectType": "ai-ml",
+  "projectName": "Megatron-LM & Megatron Core",
+  "projectDescription": "GPU-optimized library and reference training framework for training large-scale transformer models across thousands of GPUs with advanced parallelism strategies.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#040404",
-    "light": "#8ebc46",
-    "dark": "#c2db9b"
-  },
-  "favicon": "/favicon.svg",
-  "logo": {
-    "light": "https://media.brand.dev/c4e5e1d3-62a0-4c8b-b82f-3f9f163c2cda.svg",
-    "dark": "https://media.brand.dev/c4e5e1d3-62a0-4c8b-b82f-3f9f163c2cda.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/NVIDIA/Megatron-LM"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/NVIDIA/Megatron-LM"
-    }
-  },
+  "primaryColor": "#040404",
+  "lightColor": "#8ebc46",
+  "darkColor": "#c2db9b",
   "navigation": {
     "tabs": [
       {
@@ -89,5 +72,36 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Tensor, Pipeline, Data, Expert, and Context parallelism strategies",
+    "Mixed precision training: FP16, BF16, FP8, FP4",
+    "Support for GPT, LLaMA, BERT, T5, Mixtral, Mamba, and multimodal models",
+    "Mixture-of-Experts (MoE) training with DeepSeek-V3 and Qwen3",
+    "Fully Sharded Data Parallel (FSDP) with ZeRO-1/2/3",
+    "Distributed checkpointing and fault-tolerant training",
+    "High-performance inference engine with tensor parallelism",
+    "Dynamic Context Parallelism for variable-length sequences",
+    "Post-training: quantization, distillation, pruning via ModelOpt",
+    "Scales to 6144+ H100 GPUs with 47% MFU"
+  ],
+  "publicApiSurface": [
+    "megatron.core.parallel_state",
+    "megatron.core.distributed.DistributedDataParallel",
+    "megatron.core.InferenceParams",
+    "megatron.core.ModelParallelConfig",
+    "megatron.core.Timers",
+    "megatron.core.models.GPTModel",
+    "megatron.core.models.BertModel",
+    "megatron.core.transformer.TransformerBlock",
+    "megatron.core.tensor_parallel",
+    "megatron.core.pipeline_parallel",
+    "megatron.core.optimizer",
+    "megatron.core.inference",
+    "pretrain_gpt.py",
+    "pretrain_bert.py",
+    "pretrain_t5.py",
+    "pretrain_mamba.py",
+    "pretrain_vlm.py"
+  ]
 }

@@ -1,0 +1,284 @@
+---
+title: "Parallelism API"
+description: "ModelParallelConfig, parallel_state module functions, DistributedDataParallel, and tensor-parallel primitives."
+---
+
+Megatron-LM implements four orthogonal parallelism strategies: **tensor parallelism (TP)**, **pipeline parallelism (PP)**, **context parallelism (CP)**, and **expert parallelism (EP)**. All are configured through `ModelParallelConfig` and initialized via `parallel_state.initialize_model_parallel`.
+
+## ModelParallelConfig
+
+`megatron.core.ModelParallelConfig`
+
+A `@dataclass` that is the base class for `TransformerConfig`. You rarely instantiate it directly — instead, pass these fields to `TransformerConfig`. All defaults produce a single-GPU, non-parallel setup.
+
+```python
+from megatron.core import ModelParallelConfig
+import torch
+
+config = ModelParallelConfig(
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=2,
+    context_parallel_size=1,
+    bf16=True,
+    params_dtype=torch.bfloat16,
+)
+```
+
+### Parallelism parameters
+
+<ParamField path="tensor_model_parallel_size" type="int" default="1">
+  Number of GPUs to split a single layer's tensors (weight matrices) across. Commonly called "intra-layer model parallelism" or TP size. Each tensor-parallel rank holds a horizontal shard of projection matrices.
+</ParamField>
+
+<ParamField path="pipeline_model_parallel_size" type="int" default="1">
+  Number of pipeline stages. Layers are partitioned across this many groups of tensor-parallel GPUs, each group processing a different micro-batch. Increases model depth capacity at the cost of pipeline bubble overhead.
+</ParamField>
+
+<ParamField path="virtual_pipeline_model_parallel_size" type="Optional[int]" default="None">
+  Number of virtual stages per pipeline rank for interleaved scheduling. Reduces the pipeline bubble fraction. See [Efficient Large-Scale Language Model Training](https://arxiv.org/pdf/2104.04473.pdf).
+</ParamField>
+
+<ParamField path="pipeline_model_parallel_comm_backend" type="Optional[Literal['nccl', 'ucc']]" default="None">
+  Communication backend for pipeline send/recv operations. `None` uses the default backend.
+</ParamField>
+
+<ParamField path="sequence_parallel" type="bool" default="False">
+  Activates sequence parallelism: distributes layer-norm and dropout inputs across the tensor-parallel group along the sequence dimension. Reduces peak activation memory for large models (20B+). See [Reducing Activation Recomputation](https://arxiv.org/abs/2205.05198).
+</ParamField>
+
+<ParamField path="context_parallel_size" type="int" default="1">
+  Splits the network input sequence length across this many GPUs. Useful for very long sequences where a full sequence does not fit on a single GPU. Attention requires ring-based KV exchange between CP ranks.
+</ParamField>
+
+<ParamField path="hierarchical_context_parallel_sizes" type="Optional[list[int]]" default="None">
+  A list of sizes describing multi-level (hierarchical) context parallelism. For the A2A+P2P CP pattern, the first value is the all-to-all group size and the second is the point-to-point group size.
+</ParamField>
+
+<ParamField path="hybrid_context_parallel" type="bool" default="False">
+  Enable hybrid context parallelism to balance workloads when using packed, variable-length sequences. Requires `max_seqlen_per_dp_cp_rank` to also be set.
+</ParamField>
+
+<ParamField path="max_seqlen_per_dp_cp_rank" type="Optional[int]" default="None">
+  Maximum sequence length each rank can handle per DPxCP rank. A good starting value is `max_sequence_length / context_parallel_size`.
+</ParamField>
+
+<ParamField path="expert_model_parallel_size" type="int" default="1">
+  Number of GPUs across which MoE expert weights are distributed. A value of `N` means there are `N` expert-parallel replicas.
+</ParamField>
+
+<ParamField path="expert_tensor_parallel_size" type="Optional[int]" default="None">
+  Tensor parallelism size specifically for expert layers. Defaults to `tensor_model_parallel_size` when `None`.
+</ParamField>
+
+### Initialization parameters
+
+<ParamField path="perform_initialization" type="bool" default="True">
+  Initialize weights at construction time. Set to `False` when you plan to load from a checkpoint immediately after building the model.
+</ParamField>
+
+<ParamField path="use_cpu_initialization" type="bool" default="False">
+  Allocate parameters on CPU first, then move to GPU. Avoids peak GPU memory during model construction for very large models.
+</ParamField>
+
+### Training precision parameters
+
+<ParamField path="fp16" type="bool" default="False">
+  Train with fp16 automatic mixed precision.
+</ParamField>
+
+<ParamField path="bf16" type="bool" default="False">
+  Train with bf16 automatic mixed precision. Preferred over fp16 on Ampere+ GPUs (no loss scaling needed).
+</ParamField>
+
+<ParamField path="params_dtype" type="torch.dtype" default="torch.float32">
+  Data type used for parameter initialization.
+</ParamField>
+
+<ParamField path="deterministic_mode" type="bool" default="False">
+  Force deterministic CUDA operations. Slower, but reproducible. Useful for debugging numerical issues.
+</ParamField>
+
+---
+
+## parallel_state module
+
+`megatron.core.parallel_state` (also available as `megatron.core.mpu`)
+
+This module manages all process groups and exposes rank/size query functions. Always call `initialize_model_parallel` once during setup before calling any other `parallel_state` function.
+
+### initialize_model_parallel
+
+```python
+def initialize_model_parallel(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    virtual_pipeline_model_parallel_size: Optional[int] = None,
+    pipeline_model_parallel_comm_backend: Optional[str] = None,
+    use_sharp: bool = False,
+    context_parallel_size: int = 1,
+    hierarchical_context_parallel_sizes: Optional[List[int]] = None,
+    hybrid_context_parallel: bool = False,
+    expert_model_parallel_size: int = 1,
+    num_distributed_optimizer_instances: int = 1,
+    expert_tensor_parallel_size: Optional[int] = None,
+    nccl_communicator_config_path: Optional[str] = None,
+    distributed_timeout_minutes: int = 30,
+    order: str = "tp-cp-ep-dp-pp",
+    get_embedding_ranks: Optional[Callable] = None,
+    get_position_embedding_ranks: Optional[Callable] = None,
+    create_gloo_process_groups: bool = True,
+    rank_offset: int = 0,
+    local_world_size: Optional[int] = None,
+) -> None
+```
+
+Creates all process groups according to the specified parallelism topology. Must be called after `torch.distributed.init_process_group`.
+
+The `order` parameter (default `"tp-cp-ep-dp-pp"`) controls how ranks are mapped to the parallelism dimensions.
+
+**Example — 8-GPU setup with TP=4, PP=2:**
+
+```python
+import torch
+import torch.distributed as dist
+from megatron.core import parallel_state
+
+dist.init_process_group(backend='nccl')
+
+parallel_state.initialize_model_parallel(
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=2,
+)
+```
+
+### Rank and size queries
+
+| Function | Returns |
+|---|---|
+| `get_tensor_model_parallel_rank()` | This rank's position within its TP group (0 … TP-1) |
+| `get_tensor_model_parallel_world_size()` | TP group size |
+| `get_pipeline_model_parallel_rank()` | This rank's pipeline stage index |
+| `get_pipeline_model_parallel_world_size()` | Number of pipeline stages |
+| `get_data_parallel_rank()` | This rank's position within its DP group |
+| `get_data_parallel_world_size()` | DP group size |
+| `get_context_parallel_rank()` | This rank's position within its CP group |
+| `get_context_parallel_world_size()` | CP group size |
+| `get_expert_model_parallel_rank()` | Expert-parallel rank |
+| `get_expert_model_parallel_world_size()` | Expert-parallel group size |
+
+```python
+from megatron.core import parallel_state
+
+tp_rank = parallel_state.get_tensor_model_parallel_rank()
+pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+dp_rank = parallel_state.get_data_parallel_rank()
+
+if tp_rank == 0 and pp_rank == 0:
+    print(f"Data-parallel rank: {dp_rank}")
+```
+
+### Process group getters
+
+```python
+# Get the process group for collective operations
+tp_group = parallel_state.get_tensor_model_parallel_group()
+pp_group = parallel_state.get_pipeline_model_parallel_group()
+dp_group = parallel_state.get_data_parallel_group()
+```
+
+### Pipeline stage checks
+
+```python
+is_first = parallel_state.is_pipeline_first_stage()
+is_last  = parallel_state.is_pipeline_last_stage()
+```
+
+---
+
+## DistributedDataParallel
+
+`megatron.core.DistributedDataParallel`
+
+Megatron's DDP implementation pre-allocates contiguous gradient buffers per parameter dtype and overlaps gradient reduction with the backward pass. It is used in place of `torch.nn.parallel.DistributedDataParallel`.
+
+```python
+from megatron.core import DistributedDataParallel
+from megatron.core.distributed import DistributedDataParallelConfig
+
+ddp_config = DistributedDataParallelConfig(
+    grad_reduce_in_fp32=True,
+    overlap_grad_reduce=True,
+    use_distributed_optimizer=True,
+)
+
+model_ddp = DistributedDataParallel(
+    config=transformer_config,
+    ddp_config=ddp_config,
+    module=model,
+    data_parallel_group=parallel_state.get_data_parallel_group(),
+    expert_data_parallel_group=parallel_state.get_expert_model_parallel_group(),
+)
+```
+
+<Note>
+`DistributedDataParallel` works in concert with `DistributedOptimizer`: the DDP module pre-allocates a flat gradient buffer that the optimizer shards across DP ranks.
+</Note>
+
+---
+
+## tensor_parallel module
+
+`megatron.core.tensor_parallel`
+
+Provides tensor-parallel–aware linear layers and communication primitives.
+
+### Key layers
+
+| Class | Description |
+|---|---|
+| `ColumnParallelLinear` | Linear layer split column-wise across TP ranks (Q, K, V, gate projections) |
+| `RowParallelLinear` | Linear layer split row-wise across TP ranks (output projections) |
+| `VocabParallelEmbedding` | Vocabulary embedding table sharded across TP ranks |
+
+```python
+from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+
+# Shard a 4096→16384 projection across 4 TP ranks (each rank holds 4096 columns)
+fc1 = ColumnParallelLinear(
+    input_size=4096,
+    output_size=16384,
+    config=config,
+    gather_output=False,
+)
+
+fc2 = RowParallelLinear(
+    input_size=16384,
+    output_size=4096,
+    config=config,
+    input_is_parallel=True,
+)
+```
+
+### Communication primitives
+
+```python
+from megatron.core.tensor_parallel import (
+    gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    scatter_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+    all_to_all,
+)
+```
+
+These functions insert differentiable all-reduce, all-gather, reduce-scatter, and scatter/gather collectives at the boundaries between tensor-parallel partitioned layers.
+
+### Activation checkpointing
+
+```python
+from megatron.core.tensor_parallel import checkpoint
+
+# Recompute activations during backward to save memory
+output = checkpoint(function, distribute_saved_activations, *args)
+```

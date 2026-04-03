@@ -1,0 +1,272 @@
+---
+title: 'Parallelism strategies'
+description: 'Scale training from a single GPU to thousands with Megatron Core's five composable parallelism strategies: DP, TP, PP, CP, and EP.'
+keywords: ['tensor parallelism', 'pipeline parallelism', 'data parallelism', 'context parallelism', 'expert parallelism', 'FSDP', 'distributed training']
+---
+
+Megatron Core supports five parallelism strategies that compose together to train models from billions to trillions of parameters across thousands of GPUs. You can combine any subset of them; the total GPU count is always:
+
+```
+Total GPUs = TP × PP × CP × EP × DP
+```
+
+## Overview
+
+| Strategy | Abbreviation | What it parallelizes | Memory benefit | Communication cost |
+|---|---|---|---|---|
+| Data Parallelism | DP | Batch dimension | High (with FSDP/ZeRO) | All-reduce gradients |
+| Tensor Parallelism | TP | Individual layer weights | Medium | All-gather + reduce-scatter per layer |
+| Pipeline Parallelism | PP | Model depth (layers) | High | Point-to-point activations |
+| Context Parallelism | CP | Sequence length | High | All-gather KV across sequence |
+| Expert Parallelism | EP | MoE experts | High | All-to-all token routing |
+
+---
+
+## 1. Data parallelism (DP)
+
+Data parallelism replicates the full model across GPUs and splits the training batch. It is the default and most common strategy—every other strategy is layered on top of it.
+
+### Standard DDP
+
+Each GPU holds a complete model copy and processes a shard of the batch. Gradients are synchronized via all-reduce at the end of the backward pass.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --data-parallel-sharding-strategy no_shard
+```
+
+### Megatron FSDP (ZeRO-style sharding)
+
+Megatron FSDP shards optimizer states, gradients, and parameters across data-parallel ranks, reducing per-GPU memory at the cost of additional all-gather and reduce-scatter communication. It is approximately 15% faster than PyTorch FSDP2 on equivalent hardware.
+
+```bash
+# Enable Megatron FSDP with full parameter sharding (ZeRO-3 equivalent)
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --use-megatron-fsdp \
+    --data-parallel-sharding-strategy optim_grads_params \
+    --no-gradient-accumulation-fusion \
+    --use-distributed-optimizer
+```
+
+**Sharding strategies:**
+
+| Flag value | What is sharded | ZeRO equivalent |
+|---|---|---|
+| `optim` | Optimizer states only | ZeRO-1 |
+| `optim_grads` | Gradients + optimizer states | ZeRO-2 |
+| `optim_grads_params` | Parameters + gradients + optimizer states | ZeRO-3 |
+
+<Tip>
+Always enable `--use-distributed-optimizer` for multi-GPU training. It provides faster checkpointing and reduces memory when combined with FSDP, with no downsides.
+</Tip>
+
+---
+
+## 2. Tensor parallelism (TP)
+
+Tensor parallelism splits individual layer weight matrices across GPUs within a single node. The column-parallel and row-parallel linear layers in Megatron Core communicate via all-gather (forward) and reduce-scatter (backward) at each layer boundary.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --tensor-model-parallel-size 4 \
+    --sequence-parallel               # Always enable with TP
+```
+
+**When to use TP:**
+- A single layer's weight matrix doesn't fit in GPU memory
+- Hidden dimension is large (4096+)
+- You are on a single node with high-bandwidth NVLink interconnects
+
+<Warning>
+Tensor parallelism has high communication frequency (every layer). Keep TP within a single node where NVLink is available. Crossing node boundaries with TP over InfiniBand usually hurts performance.
+</Warning>
+
+### Sequence parallelism
+
+Sequence parallelism (`--sequence-parallel`) is an extension to TP that also shards the sequence dimension during LayerNorm and Dropout operations. This eliminates the activation memory replication that would otherwise exist at non-TP regions of the model.
+
+```bash
+# Always pair --sequence-parallel with --tensor-model-parallel-size > 1
+--tensor-model-parallel-size 4
+--sequence-parallel
+```
+
+Sequence parallelism reduces activation memory by a factor of TP degree in LayerNorm and Dropout, making it especially valuable for large models (20B+ parameters).
+
+<Note>
+Sequence parallelism (`--sequence-parallel`) refers to sharding LayerNorm and Dropout activations inside a TP group. This is different from Context Parallelism, which shards the entire sequence across a CP group.
+</Note>
+
+---
+
+## 3. Pipeline parallelism (PP)
+
+Pipeline parallelism partitions the model's layers across GPUs along the depth dimension. Stage 0 holds the first set of layers, stage 1 the next, and so on. Activations flow forward through stages, and gradients flow backward in the reverse direction.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --pipeline-model-parallel-size 8          # 8 pipeline stages
+    --num-layers-per-virtual-pipeline-stage 4  # Virtual pipeline (interleaved)
+```
+
+**When to use PP:**
+- Very deep models (50+ layers) that don't fit on a single GPU even with TP
+- Distributed across multiple nodes where inter-node bandwidth is the bottleneck
+- Combined with TP for large models at scale
+
+### Pipeline schedules
+
+| Schedule | Flag | Description |
+|---|---|---|
+| 1F1B (default) | — | One forward, one backward microbatch at a time. Reduces pipeline bubble. |
+| Interleaved 1F1B | `--num-layers-per-virtual-pipeline-stage N` | Splits each stage into virtual stages, further reducing the pipeline bubble at the cost of more communication. |
+
+<Tip>
+Use `--num-layers-per-virtual-pipeline-stage` (virtual pipeline) when you have many microbatches. It reduces the pipeline bubble fraction from `(PP-1)/microbatches` to `(PP-1)/(PP*microbatches)`.
+</Tip>
+
+---
+
+## 4. Context parallelism (CP)
+
+Context parallelism splits long input sequences across GPUs. Unlike sequence parallelism (which only shards LayerNorm and Dropout), CP shards all activations along the sequence dimension throughout the entire model—including attention.
+
+Because attention requires each token's query to attend to all tokens' keys and values, CP uses ring-topology point-to-point communication to exchange KV tensors between CP peers during the forward pass, and reduces KV gradients during the backward pass.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --context-parallel-size 2 \
+    --cp-comm-type p2p            # Ring-style point-to-point communication
+```
+
+**When to use CP:**
+- Sequence lengths of 8K or more
+- You have already maximized TP within a node and still face activation memory pressure
+- Training with MHA, MQA, or GQA (CP supports all three; MQA/GQA reduce KV communication volume)
+
+**CP vs TP for long sequences:** Increasing TP reduces memory but also shortens the GEMM operations, eventually making them too small to overlap with communication latency. CP avoids this: each GPU still runs full-width GEMMs, just on a shorter sequence chunk.
+
+<Tip>
+Prefer CP over increasing TP when dealing with long sequences. CP reduces both activation memory and compute by CP-fold, while keeping GEMMs large enough to fully utilize the GPU.
+</Tip>
+
+### Dynamic context parallelism
+
+Megatron Core supports Dynamic CP, which adaptively sizes CP groups per sequence when training on variable-length packed data. This avoids padding waste and provides up to 1.48× speedup over fixed CP with variable-length sequences.
+
+---
+
+## 5. Expert parallelism (EP)
+
+Expert parallelism distributes the experts of a Mixture-of-Experts (MoE) model across GPUs. Each GPU holds a subset of experts; token routing uses all-to-all communication to dispatch tokens to the correct expert GPU and collect results.
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --expert-model-parallel-size 8 \   # 8 expert-parallel GPUs
+    --num-experts 64 \                  # 64 experts per MoE layer
+    --moe-grouped-gemm                  # Fused expert GEMM (recommended)
+```
+
+**When to use EP:**
+- You are training a MoE model (Mixtral, DeepSeek, Qwen-MoE, etc.)
+- Number of experts is large enough to benefit from distribution (typically 8+)
+- You want to scale parameter count without proportionally increasing compute
+
+<Warning>
+When combining EP with TP, you **must** enable sequence parallelism. Without it, Megatron Core will emit a warning and results may be incorrect.
+
+```bash
+--tensor-model-parallel-size 4
+--expert-model-parallel-size 8
+--sequence-parallel           # Required with EP + TP
+```
+</Warning>
+
+---
+
+## Combining strategies
+
+### Real-world configurations
+
+#### Language models
+
+| Model | Size | GPUs | TP | PP | CP | EP | Notes |
+|---|---|---|---|---|---|---|---|
+| LLaMA-3 | 8B | 8 | 1 | 1 | 2 | 1 | CP=2 for 8K sequence length |
+| LLaMA-3 | 70B | 64 | 4 | 4 | 2 | 1 | Balanced TP+PP for 70B scale |
+| LLaMA-3.1 | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism (TP+PP+CP) |
+| GPT-3 | 175B | 512 | 4 | 8 | 1 | 1 | Standard large model config |
+
+#### Mixture-of-Experts models
+
+| Model | Size | GPUs | TP | PP | CP | EP | Notes |
+|---|---|---|---|---|---|---|---|
+| Mixtral | 8×7B | 64 | 1 | 4 | 1 | 8 | EP=8 matches 8 experts |
+| Mixtral | 8×22B | 256 | 4 | 4 | 1 | 8 | TP+PP+EP for large MoE |
+| DeepSeek-V3 | 671B | 1024 | 2 | 16 | 1 | 64 | Massive MoE, 256 total experts |
+
+### Full example: LLaMA-3 70B on 64 GPUs
+
+```bash
+# TP=4, PP=4, CP=2, DP=2 → 4 × 4 × 2 × 2 = 64 GPUs
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --tensor-model-parallel-size 4 \
+    --pipeline-model-parallel-size 4 \
+    --context-parallel-size 2 \
+    --num-layers 80 \
+    --hidden-size 8192 \
+    --num-attention-heads 64 \
+    --seq-length 8192 \
+    --micro-batch-size 1 \
+    --global-batch-size 512 \
+    --bf16
+```
+
+---
+
+## Performance optimizations
+
+### Communication overlap
+
+All three communication-intensive dimensions support overlapping communication with computation:
+
+```bash
+--overlap-grad-reduce   # Overlap DP gradient all-reduce with backward pass
+--overlap-param-gather  # Overlap DP parameter all-gather with forward pass
+--tp-comm-overlap       # Overlap TP all-gather/reduce-scatter with GEMMs
+```
+
+### Distributed optimizer
+
+```bash
+--use-distributed-optimizer
+```
+
+Shards optimizer states across data-parallel ranks. Recommended for all multi-GPU runs. Also enables faster async checkpointing.
+
+### Sequence parallelism
+
+```bash
+--sequence-parallel
+```
+
+Always enable when using `--tensor-model-parallel-size > 1`. Reduces activation memory in LayerNorm and Dropout layers by the TP degree.
+
+---
+
+## Choosing a strategy: decision guide
+
+1. **Start with data parallelism only.** If the model fits on one GPU, DP is sufficient and has the lowest overhead.
+2. **Add tensor parallelism** if individual layers exceed GPU memory. Keep TP within a single node (NVLink).
+3. **Add pipeline parallelism** if the full model (after TP) still doesn't fit on a single GPU, or if you are scaling to many nodes.
+4. **Add context parallelism** if your sequence length is 8K or more and you are hitting activation memory limits.
+5. **Add expert parallelism** if you are training a MoE model.
+
+### Memory vs. communication tradeoffs
+
+| Constraint | Solution |
+|---|---|
+| Per-GPU memory too high | Use FSDP (`optim_grads_params`), increase TP, or enable activation checkpointing |
+| TP communication bottleneck | Reduce TP degree, use CP instead for sequence memory savings |
+| Slow inter-node scaling | Increase PP (lower communication frequency than TP), enable communication overlap flags |
+| MoE token imbalance | Use `--moe-grouped-gemm` and tune `--moe-expert-capacity-factor` |

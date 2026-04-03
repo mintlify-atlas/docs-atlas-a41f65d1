@@ -1,0 +1,186 @@
+---
+title: "Your First Training Run"
+description: "Run a minimal distributed training loop on 2 GPUs, then scale up to a full LLaMA-3 8B FP8 job on 8 GPUs."
+---
+
+This guide walks you through two training examples — a minimal 2-GPU loop to verify your setup, and a full LLaMA-3 8B FP8 training run on 8 GPUs — then shows you how to prepare your own data.
+
+<Steps>
+  <Step title="Install Megatron Core">
+    Make sure you have completed [installation](/get-started/installation) before proceeding. For this quickstart you also need the Megatron-LM repository, which contains the example scripts:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    ```
+
+    If you installed from PyPI rather than from source, the `megatron-core` package is already on your path. The examples directory in the cloned repo provides the training scripts.
+  </Step>
+
+  <Step title="Run the minimal 2-GPU training loop">
+    Start with the simplest possible example: a small GPT model trained on mock data across 2 GPUs. This verifies that distributed training, tensor parallelism, and checkpointing all work correctly in your environment.
+
+    ```bash
+    torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
+    ```
+
+    The script sets up a 2-layer GPT model with tensor parallelism (`TP=2`) and runs 5 training iterations, then saves and reloads a distributed checkpoint. You should see output similar to:
+
+    ```
+    Iteration 0: Losses reduced: [{'lm loss': tensor(...)}]
+    Iteration 1: Losses reduced: [{'lm loss': tensor(...)}]
+    ...
+    Successfully loaded the model
+    ```
+
+    **What the script does:**
+
+    The example in `examples/run_simple_mcore_train_loop.py` demonstrates the core Megatron API surface:
+
+    ```python
+    from megatron.core import parallel_state
+    from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.distributed import DistributedDataParallel
+
+    # 1. Initialize distributed process groups
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+    )
+
+    # 2. Build a model with TransformerConfig
+    transformer_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=12,
+        num_attention_heads=4,
+        pipeline_dtype=torch.float32,
+    )
+    gpt_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_local_spec(),
+        vocab_size=100,
+        max_sequence_length=64,
+    )
+
+    # 3. Wrap with DistributedDataParallel
+    gpt_model = DistributedDataParallel(config=config, ddp_config=ddp_config, module=gpt_model)
+
+    # 4. Run forward-backward using Megatron's pipeline schedule
+    forward_backward_func = get_forward_backward_func()
+    losses_reduced = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=train_iterator,
+        model=gpt_model,
+        num_microbatches=1,
+        seq_length=64,
+        micro_batch_size=8,
+        forward_only=False,
+    )
+
+    # 5. Finalize gradients across DP and TP groups, then step
+    finalize_model_grads([gpt_model])
+    optim.step()
+    ```
+
+    <Note>
+      `finalize_model_grads` is required when using tensor parallelism. It all-reduces gradients for non-tensor-parallel parameters (such as LayerNorm) across tensor parallel ranks, and all-reduces all gradients across data parallel ranks.
+    </Note>
+  </Step>
+
+  <Step title="Train LLaMA-3 8B with FP8 on 8 GPUs">
+    Once the minimal example runs successfully, try the full LLaMA-3 8B training script. This requires 8 GPUs with Hopper, Ada, or Blackwell architecture for FP8 support.
+
+    ```bash
+    ./examples/llama/train_llama3_8b_h100_fp8.sh
+    ```
+
+    By default the script uses **mock data** so you can verify the full training stack — model architecture, data loading, FP8 kernels, checkpointing, and TensorBoard logging — without needing a real dataset.
+
+    **Key configuration:**
+
+    | Parameter | Value |
+    |---|---|
+    | GPUs | 8 (single node) |
+    | Precision | FP8 (hybrid format) |
+    | Sequence length | 8192 tokens |
+    | Global batch size | 128 |
+    | Hidden size | 4096 |
+    | Attention heads | 32 (GQA with 8 KV heads) |
+    | Layers | 32 |
+    | Vocabulary size | 128,256 |
+
+    **To use real data**, pass the tokenizer path and data prefix as arguments:
+
+    ```bash
+    ./examples/llama/train_llama3_8b_h100_fp8.sh \
+      checkpoints/llama3_8b_fp8 \
+      tensorboard_logs/llama3_8b_fp8 \
+      /path/to/tokenizer.model \
+      /path/to/processed_data
+    ```
+
+    Checkpoints are saved to `checkpoints/llama3_8b_fp8` and TensorBoard logs to `tensorboard_logs/llama3_8b_fp8` by default.
+
+    <Tip>
+      The script enables several performance optimizations by default: distributed optimizer (`--use-distributed-optimizer`), overlapped gradient reduction (`--overlap-grad-reduce`), overlapped parameter gather (`--overlap-param-gather`), and cross-entropy loss fusion (`--cross-entropy-loss-fusion`). These are recommended defaults for production training runs.
+    </Tip>
+  </Step>
+
+  <Step title="Prepare your own data">
+    Megatron expects tokenized binary files (`.bin` and `.idx`) for high-throughput data loading. Use `tools/preprocess_data.py` to convert a raw JSONL file into this format.
+
+    **1. Create a JSONL file**
+
+    Each line must contain a `text` field:
+
+    ```json
+    {"text": "Your first training document goes here."}
+    {"text": "Each line is an independent training sample."}
+    {"text": "Add as many samples as you need."}
+    ```
+
+    **2. Preprocess the data**
+
+    ```bash
+    python tools/preprocess_data.py \
+        --input data.jsonl \
+        --output-prefix processed_data \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --workers 8 \
+        --append-eod
+    ```
+
+    This produces `processed_data.bin` and `processed_data.idx`. Pass the prefix (`processed_data`) as the `--data-path` argument to your training script.
+
+    **Key arguments:**
+
+    | Argument | Description |
+    |---|---|
+    | `--input` | Path to input JSON or JSONL file |
+    | `--output-prefix` | Prefix for the output `.bin` and `.idx` files |
+    | `--tokenizer-type` | `HuggingFaceTokenizer`, `GPT2BPETokenizer`, or `NullTokenizer` |
+    | `--tokenizer-model` | Path to tokenizer model file |
+    | `--workers` | Number of parallel preprocessing workers |
+    | `--append-eod` | Append an end-of-document token between documents |
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Parallelism Strategies" icon="diagram-project" href="/concepts/parallelism">
+    Learn how to combine Tensor, Pipeline, Data, Expert, and Context Parallelism to scale training across hundreds or thousands of GPUs.
+  </Card>
+  <Card title="Data Preparation" icon="database" href="/training/data-preparation">
+    Deep dive into Megatron's binary dataset format, blending multiple datasets, and using Megatron Energon for multi-modal data.
+  </Card>
+  <Card title="Training Examples" icon="code" href="/training/training-examples">
+    Browse pre-configured scripts for GPT, LLaMA, DeepSeek, Qwen, Mixtral MoE, and Mamba architectures.
+  </Card>
+  <Card title="Advanced Features" icon="sliders" href="/features/moe">
+    Explore MoE training, fault-tolerant checkpointing, FP8 quantization, and inference serving.
+  </Card>
+</CardGroup>

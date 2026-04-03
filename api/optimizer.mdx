@@ -1,0 +1,257 @@
+---
+title: "Optimizers"
+description: "OptimizerConfig, get_megatron_optimizer, DistributedOptimizer, and the learning-rate scheduler API."
+---
+
+The `megatron.core.optimizer` package provides optimizer construction, sharded (distributed) optimization, and learning-rate scheduling for large-scale model training. The main entry point is `get_megatron_optimizer`.
+
+## get_megatron_optimizer
+
+```python
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+
+def get_megatron_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
+    use_gloo_process_groups: bool = True,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    dump_param_to_param_group_map: Optional[str] = None,
+) -> MegatronOptimizer
+```
+
+Factory function that builds the appropriate Megatron optimizer for a list of model chunks. Handles:
+
+- Standard optimizers: Adam, AdamW, SGD
+- Emerging optimizers: Muon, Lion (requires `emerging-optimizers >= 0.2`)
+- Mixed-precision wrapping (fp16/bf16 loss scaling)
+- Distributed sharding via `DistributedOptimizer`
+- Expert-parallel parameter groups for MoE models
+
+**Basic usage:**
+
+```python
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+
+opt_config = OptimizerConfig(
+    optimizer='adam',
+    lr=1e-4,
+    min_lr=1e-5,
+    weight_decay=0.01,
+    adam_beta1=0.9,
+    adam_beta2=0.95,
+    adam_eps=1e-8,
+    bf16=True,
+    use_distributed_optimizer=True,
+)
+
+optimizer = get_megatron_optimizer(
+    config=opt_config,
+    model_chunks=model_chunks,   # list of DistributedDataParallel-wrapped models
+)
+```
+
+<ParamField path="config" type="OptimizerConfig" required>
+  All optimizer hyperparameters plus precision and distributed-optimizer flags.
+</ParamField>
+
+<ParamField path="model_chunks" type="List[MegatronModule]" required>
+  One or more model chunks (typically `DistributedDataParallel`-wrapped). For pipeline parallelism with interleaving, pass all virtual stages.
+</ParamField>
+
+<ParamField path="config_overrides" type="Optional[Dict[ParamKey, ParamGroupOverride]]" default="None">
+  Per-parameter-group overrides for learning rate, weight decay, or optimizer type. When `None`, standard defaults are applied (bias/1-D parameters get `weight_decay=0`). Build with `get_standard_config_overrides(config)` and extend as needed.
+</ParamField>
+
+<ParamField path="use_gloo_process_groups" type="bool" default="True">
+  Create Gloo process groups for CPU-based collectives (used in the distributed optimizer for state synchronization). Set `False` in environments where Gloo is unavailable.
+</ParamField>
+
+<ParamField path="pg_collection" type="Optional[ProcessGroupCollection]" default="None">
+  Explicit process-group collection. When `None`, groups are obtained from the global `parallel_state`.
+</ParamField>
+
+<ParamField path="dump_param_to_param_group_map" type="Optional[str]" default="None">
+  If set, save a mapping from parameter name to parameter group index to this path (as a distributed checkpoint). Useful for debugging optimizer group assignment.
+</ParamField>
+
+---
+
+## OptimizerConfig
+
+`megatron.core.optimizer.OptimizerConfig`
+
+The single configuration dataclass for all optimizer settings. Also imported as `AdamOptimizerConfig` and `SGDOptimizerConfig` (backward-compatible aliases for the same class).
+
+### General parameters
+
+<ParamField path="optimizer" type="str" default="'adam'">
+  Optimizer name. Supported values: `'adam'` (AdamW/Adam), `'sgd'`, `'lion'` (requires `emerging-optimizers`), `'muon'` (requires `emerging-optimizers`). Can be overridden per-parameter via `config_overrides`.
+</ParamField>
+
+<ParamField path="lr" type="Optional[float]" default="None">
+  Peak learning rate used by the scheduler. Required for most training runs.
+</ParamField>
+
+<ParamField path="min_lr" type="Optional[float]" default="None">
+  Minimum learning rate; the scheduler will not reduce LR below this value.
+</ParamField>
+
+<ParamField path="decoupled_lr" type="Optional[float]" default="None">
+  Separate peak learning rate for embedding and output (logit) parameters.
+</ParamField>
+
+<ParamField path="decoupled_min_lr" type="Optional[float]" default="None">
+  Minimum learning rate for embedding / output parameters.
+</ParamField>
+
+<ParamField path="weight_decay" type="float" default="0.01">
+  L2 weight-decay coefficient. Bias parameters and 1-D parameters (layer-norm scales) are automatically excluded from weight decay by the default `config_overrides`.
+</ParamField>
+
+### Adam parameters
+
+<ParamField path="adam_beta1" type="float" default="0.9">
+  Exponential decay rate for the first moment (gradient) estimate.
+</ParamField>
+
+<ParamField path="adam_beta2" type="float" default="0.999">
+  Exponential decay rate for the second moment (gradient squared) estimate.
+</ParamField>
+
+<ParamField path="adam_eps" type="float" default="1e-8">
+  Epsilon added to the denominator for numerical stability.
+</ParamField>
+
+<ParamField path="decoupled_weight_decay" type="bool" default="True">
+  When `True`, uses AdamW (weight decay applied directly to parameters, decoupled from the gradient update). When `False`, uses standard Adam with L2 regularization.
+</ParamField>
+
+### SGD parameters
+
+<ParamField path="sgd_momentum" type="float" default="0.9">
+  Momentum factor for SGD.
+</ParamField>
+
+### Precision parameters
+
+<ParamField path="fp16" type="bool" default="False">
+  Use fp16 mixed-precision training with dynamic loss scaling.
+</ParamField>
+
+<ParamField path="bf16" type="bool" default="False">
+  Use bf16 mixed-precision training (no loss scaling required on Ampere+ GPUs).
+</ParamField>
+
+<ParamField path="params_dtype" type="torch.dtype" default="torch.float32">
+  Data type for parameter initialization.
+</ParamField>
+
+<ParamField path="use_precision_aware_optimizer" type="bool" default="False">
+  Allow optimizer state tensors (master params, exp_avg, exp_avg_sq) to use reduced precision types specified by `main_params_dtype`, `exp_avg_dtype`, and `exp_avg_sq_dtype`.
+</ParamField>
+
+### Loss scaling parameters
+
+<ParamField path="loss_scale" type="Optional[float]" default="None">
+  Fixed loss scale for fp16 training. When `None`, dynamic loss scaling is used.
+</ParamField>
+
+<ParamField path="initial_loss_scale" type="float" default="4294967296.0">
+  Starting loss scale for dynamic loss scaling (`2^32`).
+</ParamField>
+
+<ParamField path="min_loss_scale" type="float" default="1.0">
+  Minimum loss scale; dynamic scaling will not go below this value.
+</ParamField>
+
+<ParamField path="loss_scale_window" type="float" default="1000">
+  Number of iterations between loss-scale increases.
+</ParamField>
+
+<ParamField path="hysteresis" type="int" default="2">
+  Number of consecutive overflow iterations allowed before the loss scale is reduced.
+</ParamField>
+
+### Distributed optimizer parameters
+
+<ParamField path="use_distributed_optimizer" type="bool" default="False">
+  Shard optimizer states across the data-parallel group (ZeRO Stage 1/2 equivalent). Significantly reduces optimizer memory. Required for training models larger than GPU memory.
+</ParamField>
+
+---
+
+## DistributedOptimizer
+
+`megatron.core.optimizer.DistributedOptimizer`
+
+Shards optimizer states (and optionally parameters) across data-parallel ranks. Each rank owns a contiguous shard of the parameter + gradient buffer, reducing per-GPU optimizer memory by a factor of `data_parallel_world_size`.
+
+<Note>
+`DistributedOptimizer` is created automatically by `get_megatron_optimizer` when `config.use_distributed_optimizer=True`. You do not normally instantiate it directly.
+</Note>
+
+```python
+opt_config = OptimizerConfig(
+    optimizer='adam',
+    lr=3e-4,
+    bf16=True,
+    use_distributed_optimizer=True,   # enables DistributedOptimizer
+)
+
+optimizer = get_megatron_optimizer(opt_config, model_chunks)
+# optimizer is a DistributedOptimizer (or ChainedOptimizer containing one)
+```
+
+The distributed optimizer integrates with the `DistributedDataParallel` gradient buffers: the DDP module's contiguous grad buffer is divided into per-rank shards, and each rank maintains the Adam state only for its shard.
+
+---
+
+## Learning-rate scheduling
+
+`megatron.core.optimizer_param_scheduler`
+
+The `OptimizerParamScheduler` class manages learning-rate warm-up and decay schedules. It is configured directly from training arguments and called each iteration.
+
+```python
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+scheduler = OptimizerParamScheduler(
+    optimizer=optimizer,
+    init_lr=0.0,
+    max_lr=1e-4,
+    min_lr=1e-5,
+    lr_warmup_steps=2000,
+    lr_decay_steps=100_000,
+    lr_decay_style='cosine',   # 'linear', 'cosine', or 'constant'
+    start_wd=0.01,
+    end_wd=0.01,
+    wd_incr_steps=0,
+    wd_incr_style='constant',
+)
+
+# In your training loop:
+for step in range(num_steps):
+    scheduler.step(increment=consumed_samples)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+```
+
+---
+
+## Available optimizer classes
+
+| Class | Module | Notes |
+|---|---|---|
+| `MegatronOptimizer` | `megatron.core.optimizer.optimizer` | Abstract base |
+| `FP32Optimizer` | `megatron.core.optimizer.optimizer` | Full fp32, no loss scaling |
+| `Float16OptimizerWithFloat16Params` | `megatron.core.optimizer.optimizer` | fp16/bf16 with loss scaling |
+| `DistributedOptimizer` | `megatron.core.optimizer.distrib_optimizer` | Sharded ZeRO-style optimizer |
+| `ChainedOptimizer` | `megatron.core.optimizer.optimizer` | Combines multiple sub-optimizers (dense + expert) |
+| `HybridDeviceOptimizer` | `megatron.core.optimizer.cpu_offloading` | CPU-offloaded optimizer states |
+| `LayerWiseDistributedOptimizer` | `megatron.core.optimizer.layer_wise_optimizer` | Used with Muon and emerging optimizers |
+
+<Tip>
+For most training runs, call `get_megatron_optimizer` rather than constructing any of these classes directly. The factory correctly wires process groups, grad buffers, and loss scalers.
+</Tip>

@@ -1,0 +1,196 @@
+---
+title: "Distributed Optimizer"
+description: "Reduce optimizer memory by distributing optimizer states across data parallel ranks, with options for overlap, FSDP, and CPU offload."
+keywords: ["distributed optimizer", "zero", "memory", "optimizer", "fsdp", "cpu offload", "overlap"]
+---
+
+The Megatron distributed optimizer (ZeRO-1 equivalent) saves memory by distributing optimizer states evenly across data parallel ranks instead of replicating them. This is the primary mechanism for reducing per-GPU memory when scaling data parallelism.
+
+## Memory savings
+
+Standard optimizers replicate the full optimizer state on every data parallel rank. The distributed optimizer shards the state so each rank only holds a 1/d fraction, where d is the data parallel size.
+
+Theoretical bytes per parameter (d = data parallel size):
+
+| Configuration | Standard optimizer | Distributed optimizer |
+|---------------|-------------------|----------------------|
+| `fp16` parameters, `fp16` gradients | 20 | `4 + 16/d` |
+| `bf16` parameters, `fp32` gradients | 18 | `6 + 12/d` |
+| `fp32` parameters, `fp32` gradients | 16 | `8 + 8/d` |
+
+<Note>
+The distributed optimizer always maintains `fp32` master parameters for the optimizer step, regardless of the model weight dtype. Only the main parameters and optimizer states are sharded; the model weights used in forward/backward passes are in the configured mixed precision dtype.
+</Note>
+
+For example, with `bf16` weights and `d=8`, the distributed optimizer uses `6 + 12/8 = 7.5` bytes/parameter versus 18 bytes for the standard optimizer — a **2.4× reduction**.
+
+## How it works
+
+The distributed optimizer uses contiguous parameter and gradient buffers. The update cycle per iteration is:
+
+<Steps>
+  <Step title="Backward pass">
+    The backward pass completes and the gradient buffer is populated in the mixed precision dtype (e.g., `bf16`).
+  </Step>
+  <Step title="Reduce-scatter gradients">
+    A **reduce-scatter** is called across DP ranks. Each rank ends up with a fully reduced slice of the gradient buffer corresponding to its parameter shard.
+  </Step>
+  <Step title="Optimizer step">
+    Each rank runs `optimizer.step()` on its local shard using `fp32` main gradients.
+  </Step>
+  <Step title="Cast parameters">
+    Each rank copies its updated `fp32` main parameters back to the `bf16` parameter buffer, casting back to the model dtype.
+  </Step>
+  <Step title="All-gather parameters">
+    An **all-gather** distributes the updated parameters to all DP ranks. PyTorch module parameters point into this buffer, so forward passes can begin immediately.
+  </Step>
+  <Step title="Zero gradients">
+    The gradient buffer is zeroed in preparation for the next iteration.
+  </Step>
+</Steps>
+
+## Enabling the distributed optimizer
+
+```bash
+--use-distributed-optimizer
+```
+
+This single flag enables the full distributed optimizer. It is compatible with all model parallelism strategies (TP, PP, EP, CP).
+
+## Communication overlap
+
+Hiding the all-gather and reduce-scatter collectives behind computation is critical for performance. Two flags control this:
+
+```bash
+--overlap-grad-reduce    # Overlap gradient reduce-scatter with backward pass
+--overlap-param-gather   # Overlap parameter all-gather with forward pass
+```
+
+With both flags enabled, DP communication is chunked at Transformer layer granularity and launched asynchronously alongside the corresponding computation phase.
+
+<Tip>
+Always enable `--overlap-grad-reduce` and `--overlap-param-gather` together with `--use-distributed-optimizer`. The overlap is particularly important for large DP sizes where the collective volume is significant.
+</Tip>
+
+## Configuration flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--use-distributed-optimizer` | Enable distributed optimizer (ZeRO-1) | False |
+| `--overlap-grad-reduce` | Overlap gradient reduce-scatter with backward | False |
+| `--overlap-param-gather` | Overlap parameter all-gather with forward | False |
+| `--tp-comm-overlap` | Overlap TP all-gather/reduce-scatter with compute | False |
+| `--optimizer-cpu-offload` | Offload optimizer states to CPU memory | False |
+| `--use-precision-aware-optimizer` | Use BF16 optimizer states (requires TE) | False |
+| `--exp-avg-dtype` | Dtype for first moment (`bf16`, `fp32`) | fp32 |
+| `--exp-avg-sq-dtype` | Dtype for second moment (`bf16`, `fp32`) | fp32 |
+| `--fp8-param-gather` | All-gather parameters in FP8 (halves gather volume) | False |
+| `--grad-reduce-in-fp32` | Reduce gradients in FP32 for numerical stability | True |
+
+## FSDP integration
+
+Megatron Core supports Fully Sharded Data Parallelism (FSDP) for MoE models as of MCore v0.15. FSDP can be combined with Expert Parallelism:
+
+```bash
+--use-distributed-optimizer
+--num-distributed-optimizer-instances <N>   # Hybrid Shard: N instances of dist optimizer
+```
+
+The `--num-distributed-optimizer-instances` flag enables **Hybrid Shard Data Parallelism**, which partitions the optimizer state within subgroups of DP ranks. This reduces the all-gather and reduce-scatter collective size while still benefiting from partial sharding.
+
+## CPU offload
+
+For very large models where GPU memory is exhausted even with the distributed optimizer, optimizer states can be offloaded to CPU DRAM:
+
+```bash
+--use-distributed-optimizer
+--optimizer-cpu-offload
+```
+
+<Warning>
+CPU offload adds significant H2D/D2H transfer overhead at each optimizer step. Use this only when GPU memory is the binding constraint. Profile with and without offload to measure the throughput impact.
+</Warning>
+
+### Precision-aware optimizer (BF16 states)
+
+A less intrusive alternative that reduces optimizer state memory by ~50%:
+
+```bash
+--use-precision-aware-optimizer
+--exp-avg-dtype bf16
+--exp-avg-sq-dtype bf16
+```
+
+This stores the Adam `exp_avg` and `exp_avg_sq` moments in BF16 instead of FP32, requiring TransformerEngine ≥ 1.x. The bytes-per-parameter equation for `bf16` weights becomes `6 + 8/d` with BF16 moments, versus `6 + 12/d` with FP32 moments.
+
+## MoE-specific behavior
+
+For MoE models, the distributed optimizer shards expert parameters in the same way as dense parameters, treating Expert Parallelism as a sub-dimension of Data Parallelism. Combined with the overlap flags, this hides All-to-All and parameter-gather latencies:
+
+```bash
+--use-distributed-optimizer
+--overlap-grad-reduce
+--overlap-param-gather
+--overlap-moe-expert-parallel-comm    # Overlap EP All-to-All at batch level
+--delay-wgrad-compute                 # Required for EP overlap
+```
+
+## Example: bf16 training with full overlap
+
+```bash
+torchrun --nproc_per_node=8 pretrain_gpt.py \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 2 \
+    --sequence-parallel \
+    --use-distributed-optimizer \
+    --overlap-grad-reduce \
+    --overlap-param-gather \
+    --tp-comm-overlap \
+    --bf16 \
+    --num-layers 32 \
+    --hidden-size 4096 \
+    --num-attention-heads 32 \
+    --seq-length 4096 \
+    --max-position-embeddings 4096 \
+    --micro-batch-size 2 \
+    --global-batch-size 256 \
+    --lr 1e-4 \
+    --train-iters 100000 \
+    --data-path /path/to/data \
+    --vocab-file /path/to/vocab.json \
+    --merge-file /path/to/merges.txt \
+    --save /path/to/checkpoints \
+    --load /path/to/checkpoints
+```
+
+## Performance tips
+
+<Tip>
+The distributed optimizer works best when combined with other memory-reduction strategies. A typical high-performance setup for large models:
+
+1. Enable `--use-distributed-optimizer` to shard optimizer states.
+2. Enable `--overlap-grad-reduce` and `--overlap-param-gather` to hide DP communication.
+3. Enable `--sequence-parallel` with TP to shard activations.
+4. Use `--use-precision-aware-optimizer` with BF16 moment dtypes if TransformerEngine is available.
+5. Enable `--tp-comm-overlap` if `--tensor-model-parallel-size >= 2`.
+</Tip>
+
+### Communication bottleneck identification
+
+| Communication type | Overlap config |
+|-------------------|----------------|
+| DP gradient reduce-scatter | `--overlap-grad-reduce` |
+| DP parameter all-gather | `--overlap-param-gather` |
+| TP all-gather/reduce-scatter | `--tp-comm-overlap` |
+| EP All-to-All | `--overlap-moe-expert-parallel-comm --delay-wgrad-compute` |
+| PP send/recv | Enable VPP with `--num-layers-per-virtual-pipeline-stage` |
+
+### FP8 parameter gather
+
+For additional bandwidth savings on the all-gather, use FP8 primary weights:
+
+```bash
+--fp8-param-gather   # Halves all-gather communication volume
+```
+
+This gathers parameters in FP8 instead of BF16, reducing the all-gather volume by 50%. Requires FP8 training (`--fp8-format e4m3`).

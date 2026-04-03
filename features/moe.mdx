@@ -1,0 +1,299 @@
+---
+title: "Mixture-of-Experts (MoE)"
+description: "Train large-scale sparse MoE models with Expert Parallelism, load balancing, and production-ready optimizations in Megatron Core."
+keywords: ["moe", "mixture of experts", "expert parallelism", "deepseek", "mixtral", "qwen", "sparse"]
+---
+
+Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models. It provides the foundational architecture, performance optimizations, and parallelism strategies used across the industry for models like DeepSeek-V3, Mixtral, and Qwen3.
+
+## Supported models
+
+<CardGroup cols={3}>
+  <Card title="DeepSeek" icon="layer-group">
+    DeepSeek-V2, DeepSeek-V3 (with MTP), and DeepSeek-V3.2
+  </Card>
+  <Card title="Mixtral" icon="grid-2">
+    Mixtral-8x7B and Mixtral-8x22B
+  </Card>
+  <Card title="Qwen" icon="cube">
+    Qwen2-57B-A14B, Qwen3-30B-A3B, and Qwen3-235B-A22B
+  </Card>
+</CardGroup>
+
+## Quick start
+
+To train a top-2 MoE model with 8 experts and auxiliary loss balancing, add these arguments to your Megatron training script:
+
+```bash
+# Expert configuration
+--num-experts 8
+--moe-router-load-balancing-type aux_loss
+--moe-router-topk 2
+--moe-aux-loss-coeff 1e-2
+
+# Token dispatching
+--moe-token-dispatcher-type alltoall
+```
+
+For a full end-to-end example, see the [Mixtral 8x7B training script](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/mixtral/train_mixtral_8x7b_distributed.sh).
+
+## Expert Parallelism
+
+Expert Parallelism (EP) distributes experts across GPUs so each device hosts only a subset of experts. Tokens are routed via All-to-All communication to the GPU hosting their assigned expert, processed locally, and then sent back.
+
+EP integrates with Megatron's full parallelism stack:
+
+```bash
+# Enable EP alongside TP and PP
+--expert-model-parallel-size 8    # 8-way Expert Parallelism
+--tensor-model-parallel-size 1    # TP (recommend 1 for fine-grained MoE)
+--pipeline-model-parallel-size 4  # PP for multi-node scaling
+--use-distributed-optimizer       # ZeRO-1 for optimizer state sharding
+```
+
+<Tip>
+For models like Mixtral 8x7B, `EP8×TP1` outperforms `EP4×TP2`. EP has lower communication overhead than TP for MoE layers, and larger local matrix sizes improve GPU utilization with GroupedGEMM.
+</Tip>
+
+### MoE Parallel Folding
+
+Standard parallelism frameworks constrain `EP ≤ DP`, which limits scalability. **MoE Parallel Folding** decouples the attention and MoE layer parallelism to allow independent optimization:
+
+| Layer type | Parallelism dimensions |
+|------------|----------------------|
+| Attention layers | `TP × CP × DP × PP` |
+| MoE layers | `ETP × EP × EDP × PP` |
+
+This allows you to use high TP for attention (memory efficiency) and `ETP=1` for MoE (better GEMM efficiency), while dramatically increasing the maximum achievable EP size.
+
+## Router types
+
+Routers score each token with a lightweight MLP and select the top-K experts for each token. Router logits should be computed in FP32 for precision at high expert counts.
+
+| Router type | Description | Configuration |
+|-------------|-------------|---------------|
+| **Top-K Router** | Standard routing with configurable K; uses softmax for probability computation | `--moe-router-topk 2` |
+| **Group Top-K Router** | Selects top-K expert groups first, then routes within selected groups | `--moe-router-num-groups 8 --moe-router-group-topk 4` |
+| **Score function** | Controls whether softmax or sigmoid is applied to router logits | `--moe-router-score-function softmax` |
+
+<Note>
+Keep router logits in FP32 or FP64 with `--moe-router-dtype fp32`. At high expert counts, BF16 precision can degrade output quality because expert outputs are multiplied by router scores before accumulation.
+</Note>
+
+## Load balancing
+
+Without load balancing, some experts receive many more tokens than others, causing GPU utilization imbalance. Megatron Core provides several strategies:
+
+| Strategy | Description | Configuration |
+|----------|-------------|---------------|
+| `aux_loss` | Auxiliary loss to balance expert usage per micro-batch | `--moe-router-load-balancing-type aux_loss` |
+| `seq_aux_loss` | Sequence-level auxiliary loss for per-sequence balance | `--moe-router-load-balancing-type seq_aux_loss` |
+| `global_aux_loss` | Global auxiliary loss across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
+| `sinkhorn` | Optimal transport formulation | `--moe-router-load-balancing-type sinkhorn` |
+| `aux_loss_free` | Dynamic per-expert bias without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3` |
+| `none` | No load balancing | `--moe-router-load-balancing-type none` |
+
+## Token dispatching
+
+After routing, tokens are dispatched to the GPU hosting the assigned expert via one of several backends:
+
+| Dispatcher | Description | Best for | Configuration |
+|------------|-------------|----------|---------------|
+| **alltoall** | NCCL All-to-All for token exchange | Standard EP > 1 | `--moe-token-dispatcher-type alltoall` |
+| **FlexDispatcher + DeepEP** | Removes redundant tokens during cross-node transfer; fuses intra/inter-node comms | Cross-node EP, DeepSeek-V3 | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
+| **FlexDispatcher + HybridEP** | NVIDIA-optimized dispatcher using TMA and IBGDA with native MNNVL support | GB200 NVL72, multi-node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **allgather** | Gathers all tokens to each GPU | TP-only, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+## Token dropping and capacity factors
+
+By default, Megatron Core uses dropless MoE (dMoE), which routes all tokens without dropping any. You can optionally enable token dropping with a capacity factor:
+
+```bash
+# Enable token dropping with capacity factor
+--moe-expert-capacity-factor 1.25     # Allow 25% overflow capacity
+--moe-pad-expert-input-to-capacity    # Pad instead of drop
+
+# Control drop policy
+--moe-token-drop-policy probs         # Drop by routing probability (default)
+# --moe-token-drop-policy position    # Drop by position in sequence
+```
+
+<Note>
+When `--moe-expert-capacity-factor` is not set, the dynamic shapes produced by dropless MoE prevent CUDA Graph capture of MoE layers. In that case, use `--cuda-graph-scope attn` to still capture attention layers.
+</Note>
+
+## MoE-specific training flags
+
+### Core arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--num-experts` | Number of experts | None |
+| `--expert-model-parallel-size` | EP degree | 1 |
+| `--moe-ffn-hidden-size` | Expert FFN hidden size | Same as dense FFN |
+| `--expert-tensor-parallel-size` | TP within expert layers | Same as global TP |
+| `--moe-layer-freq` | MoE layer frequency pattern | 1 |
+| `--moe-shared-expert-intermediate-size` | Shared (always-active) expert size | None |
+
+### Router arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--moe-router-topk` | Experts selected per token | 2 |
+| `--moe-router-load-balancing-type` | Balancing strategy | `aux_loss` |
+| `--moe-router-score-function` | Routing score function | `softmax` |
+| `--moe-router-pre-softmax` | Apply softmax before top-k | False |
+| `--moe-router-num-groups` | Groups for group-limited routing | None |
+| `--moe-router-group-topk` | Selected groups in group-limited routing | None |
+| `--moe-router-enable-expert-bias` | Dynamic per-expert bias (aux-loss-free) | False |
+| `--moe-router-fusion` | Fuse router projection, top-k, and aux loss | False |
+| `--moe-router-dtype` | Router precision (`fp32`, `fp64`) | None |
+| `--moe-aux-loss-coeff` | Auxiliary loss coefficient | 0.0 |
+| `--moe-z-loss-coeff` | Z-loss coefficient | None |
+
+### Performance flags
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--moe-grouped-gemm` | Batch expert GEMMs into a single kernel | False |
+| `--moe-permute-fusion` | Fuse token permutation/unpermutation | False |
+| `--overlap-moe-expert-parallel-comm` | Overlap EP All-to-All with computation | False |
+| `--delay-wgrad-compute` | Split dgrad/wgrad for EP overlap | False |
+| `--moe-shared-expert-overlap` | Overlap shared expert with EP transfer | False |
+
+## Performance tips
+
+### Recommended flags for most workloads
+
+```bash
+# FlexDispatcher with DeepEP (best performance for cross-node EP)
+--moe-token-dispatcher-type flex
+--moe-flex-dispatcher-backend deepep
+
+# Kernel fusions
+--moe-grouped-gemm
+--moe-router-fusion
+--moe-permute-fusion
+
+# Communication overlapping
+--use-distributed-optimizer
+--overlap-param-gather
+--overlap-grad-reduce
+--overlap-moe-expert-parallel-comm
+--delay-wgrad-compute
+--tp-comm-overlap
+
+# Reduce Python GC jitter
+--manual-gc
+--manual-gc-interval 10
+```
+
+### Recommended environment variables
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_NVLS_ENABLE=0
+```
+
+### Parallelism guidelines
+
+<Tip>
+Keep `EP × TP` within a single node (typically 8 GPUs) to ensure All-to-All and TP collectives use NVLink bandwidth. When scaling beyond one node, prefer PP over expanding TP or EP across nodes.
+</Tip>
+
+| Strategy | Peak activation memory | Weight memory | Optimizer states | Communication |
+|----------|----------------------|---------------|-----------------|---------------|
+| TP | 1/N (with SP) | 1/N | 1/N | High |
+| EP | ~1 (varies) | 1/N in MoE layer | 1/N | Medium |
+| PP | 1 (>1 with VPP) | 1/N | 1/N | Medium |
+| CP | 1/N | 1 | 1/N (with dist opt) | Medium |
+| DP | 1 | 1 | 1/N (with dist opt) | Low |
+
+## Upcycling
+
+Upcycling converts a pretrained dense model into an MoE model at runtime without a separate conversion step:
+
+```bash
+--moe-use-upcycling              # Load dense model from --load, convert at runtime
+--moe-upcycling-granularity 4    # Granular upcycling: expert hidden size = FFN / granularity
+```
+
+For the default strategy, each expert is initialized as a copy of the original MLP. For granular upcycling (`--moe-upcycling-granularity > 1`), experts have a smaller hidden dimension, increasing expert count while preserving total parameter count.
+
+## Full Mixtral 8x7B training example
+
+```bash
+#!/bin/bash
+# Train Mixtral 8x7B on 32 H100/A100 GPUs (4 nodes × 8 GPUs)
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+GPUS_PER_NODE=8
+NNODES=4
+WORLD_SIZE=$((GPUS_PER_NODE * NNODES))
+
+DISTRIBUTED_ARGS=(
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NNODES
+    --node_rank ${RANK:-0}
+    --master_addr ${MASTER_ADDR:-localhost}
+    --master_port ${MASTER_PORT:-6000}
+)
+
+MODEL_ARGS=(
+    --num-layers 32
+    --hidden-size 4096
+    --ffn-hidden-size 14336
+    --num-attention-heads 32
+    --seq-length 4096
+    --max-position-embeddings 32768
+    --normalization RMSNorm
+    --position-embedding-type rope
+    --swiglu
+    --disable-bias-linear
+    --untie-embeddings-and-output-weights
+    --group-query-attention
+    --num-query-groups 8
+    --no-position-embedding
+    --no-masked-softmax-fusion
+)
+
+MOE_ARGS=(
+    --num-experts 8
+    --expert-model-parallel-size 8
+    --moe-router-load-balancing-type aux_loss
+    --moe-router-topk 2
+    --moe-aux-loss-coeff 1e-2
+    --moe-grouped-gemm
+    --moe-permute-fusion
+    --moe-token-dispatcher-type alltoall
+)
+
+TRAINING_ARGS=(
+    --micro-batch-size 1
+    --global-batch-size 128
+    --lr 1e-4
+    --train-iters 500000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 0.1
+    --clip-grad 1.0
+    --bf16
+    --overlap-grad-reduce
+    --overlap-param-gather
+)
+
+MODEL_PARALLEL_ARGS=(
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 4
+    --num-layers-per-virtual-pipeline-stage 8
+    --sequence-parallel
+    --use-distributed-optimizer
+)
+
+torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+    ${MODEL_ARGS[@]} \
+    ${MOE_ARGS[@]} \
+    ${TRAINING_ARGS[@]} \
+    ${MODEL_PARALLEL_ARGS[@]}
+```

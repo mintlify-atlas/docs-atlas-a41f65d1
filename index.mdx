@@ -1,97 +1,68 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Megatron-LM & Megatron Core"
+description: "GPU-optimized library for training transformer models at scale — from 2B to 462B+ parameters across thousands of NVIDIA GPUs."
 ---
 
-## Setting up
+Megatron-LM and Megatron Core are NVIDIA's open-source frameworks for training large language models at scale. **Megatron Core** provides composable, GPU-optimized building blocks for custom training pipelines. **Megatron-LM** is a batteries-included reference implementation with pre-configured training scripts for GPT, LLaMA, Mixtral, and more.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/get-started/installation">
+    Install via PyPI or from source. Supports NGC containers and bare-metal setups.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/get-started/quickstart">
+    Run your first distributed training job in minutes with LLaMA-3 or GPT.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Parallelism Strategies" icon="diagram-project" href="/concepts/parallelism">
+    Scale training with TP, PP, DP, CP, and EP across thousands of GPUs.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/overview">
+    Explore the full Megatron Core public API — models, transformers, optimizers, and inference.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What you can build
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="LLM Pre-training" icon="brain" href="/training/training-examples">
+    Train GPT, LLaMA, BERT, T5, and Mixtral models from scratch.
+  </Card>
+  <Card title="Mixture-of-Experts" icon="network-wired" href="/features/moe">
+    Train MoE models like DeepSeek-V3 and Qwen3 with Expert Parallelism.
+  </Card>
+  <Card title="Multimodal Training" icon="image" href="/features/multimodal">
+    Train vision-language and video-language models with Megatron Energon.
+  </Card>
+  <Card title="Inference" icon="bolt" href="/features/inference">
+    Deploy models with the high-performance Megatron Core inference engine.
+  </Card>
+  <Card title="Post-Training" icon="sliders" href="/training/post-training">
+    Fine-tune with RLHF, quantize with FP8/FP4, prune, and distill.
+  </Card>
+  <Card title="Custom Frameworks" icon="puzzle-piece" href="/concepts/architecture">
+    Build custom training loops on top of Megatron Core's modular APIs.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Performance at scale
 
-## Need inspiration?
+Megatron achieves up to **47% Model FLOP Utilization (MFU)** on H100 clusters, training 462B parameter models across 6,144 GPUs with superlinear weak scaling.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Architecture overview" icon="sitemap" href="/concepts/architecture">
+    Understand Megatron Core vs Megatron-LM and how they fit together.
+  </Card>
+  <Card title="Precision & mixed precision" icon="microchip" href="/concepts/precision">
+    FP16, BF16, FP8, and FP4 training with Transformer Engine.
+  </Card>
+</CardGroup>
+
+## Ecosystem
+
+<CardGroup cols={2}>
+  <Card title="Ecosystem & integrations" icon="plug" href="/developer/ecosystem">
+    Megatron Bridge, NeMo, Megatron Energon, and Hugging Face compatibility.
+  </Card>
+  <Card title="Contributing" icon="code-pull-request" href="/developer/contributing">
+    How to contribute code, report bugs, and improve documentation.
+  </Card>
+</CardGroup>

@@ -1,0 +1,316 @@
+---
+title: "Post-Training"
+description: "Post-training capabilities in Megatron-LM: reinforcement learning, quantization, pruning, and knowledge distillation via ModelOpt."
+---
+
+Megatron-LM extends beyond pretraining with a suite of post-training capabilities. These techniques adapt pretrained foundation models for alignment, deployment efficiency, and specialized tasks without retraining from scratch.
+
+<CardGroup cols={2}>
+  <Card title="Reinforcement Learning" icon="robot">
+    Native RL training (GRPO, RLHF) via Megatron RL with `train_rl.py`. Decoupled design supports multiple inference backends.
+  </Card>
+  <Card title="Quantization" icon="microchip">
+    PTQ and QAT to FP8, INT8, NVFP4, and other formats via NVIDIA ModelOpt. Export to TensorRT-LLM, vLLM, and SGLang.
+  </Card>
+  <Card title="Pruning" icon="scissors">
+    Structured pruning of width (hidden size, FFN size, attention heads) and depth (layer count) via ModelOpt's Minitron method.
+  </Card>
+  <Card title="Knowledge Distillation" icon="graduation-cap">
+    Teacher–student distillation for model compression, including speculative decoding draft models via EAGLE3 training.
+  </Card>
+</CardGroup>
+
+## Reinforcement Learning
+
+Megatron RL adds native reinforcement learning capabilities directly to Megatron-LM, enabling large-scale RL-based post-training without leaving the Megatron ecosystem.
+
+### Architecture
+
+Megatron RL uses a **decoupled design** that separates the RL logic from the inference system:
+
+- **Agents & Environments** — Accept inference handles, return experience rollouts with rewards, implement custom reward functions
+- **Trainer/Evaluator** — Controls rollout generation, coordinates with inference backends, manages training loops
+- **Inference Interface** — Provides a `.generate(prompt, **generation_args)` endpoint; supports Megatron Core, OpenAI, and HuggingFace backends
+
+### Running RL Training
+
+RL training uses `train_rl.py`, which supports both GPT and Mamba model architectures:
+
+```bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+torchrun \
+    --nproc_per_node 8 \
+    train_rl.py \
+    --use-mcore-models \
+    --num-layers 32 \
+    --hidden-size 4096 \
+    --num-attention-heads 32 \
+    --seq-length 8192 \
+    --max-position-embeddings 8192 \
+    --tensor-model-parallel-size 1 \
+    --pipeline-model-parallel-size 1 \
+    --micro-batch-size 1 \
+    --global-batch-size 32 \
+    --train-iters 10000 \
+    --lr 1.0e-6 \
+    --bf16 \
+    --ckpt-format torch_dist \
+    --load /path/to/pretrained_checkpoint \
+    --save /path/to/rl_checkpoint \
+    --save-interval 500 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/tokenizer.model \
+    --data-path /path/to/rl_dataset
+```
+
+The RL training loop implements **GRPO** (Group Relative Policy Optimization) loss via `megatron.rl.rl_utils.calculate_grpo_loss`. Log probabilities for policy gradient updates are computed with `get_logprobs`.
+
+<Note>
+  Megatron RL is under active development and is primarily designed for research teams exploring RL post-training on NVIDIA hardware. For production RLHF deployments, consider [NeMo RL](https://github.com/NVIDIA-NeMo/RL), which is built on Megatron-Core.
+</Note>
+
+### Use Cases
+
+- RLHF (Reinforcement Learning from Human Feedback)
+- GRPO for reasoning model fine-tuning
+- Custom reward-based policy optimization
+- Research on large-scale RL post-training
+
+---
+
+## Quantization with ModelOpt
+
+[NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer) (`nvidia-modelopt`) integrates with Megatron-LM for post-training quantization (PTQ) and quantization-aware training (QAT). The integration is in `examples/post_training/modelopt/`.
+
+### Supported Models
+
+| Model | Quantization | EAGLE3 | Pruning | Distillation |
+|---|---|---|---|---|
+| `meta-llama/Llama-3.1-8B-Instruct` | Yes | Yes | Yes | Yes |
+| `meta-llama/Llama-3.1-405B-Instruct` | Yes | Yes | Yes | Yes |
+| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | Yes | Yes | — | — |
+| `deepseek-ai/DeepSeek-R1` | Yes | Yes | — | — |
+| `Qwen/Qwen3-8B` | Yes | Yes | Yes | Yes |
+| `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | Yes | — | Yes | Yes |
+| `openai/gpt-oss-20b` | Yes | Online | Yes | Yes |
+
+### Installation
+
+```bash
+pip install -U nvidia-modelopt
+```
+
+### NVFP4 Quantization
+
+Quantize a pretrained model and save a resumable Megatron-LM distributed checkpoint:
+
+```bash
+TP=1 \
+HF_MODEL_CKPT=/path/to/Llama-3.2-1B-Instruct \
+MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct_quant \
+./examples/post_training/modelopt/quantize.sh \
+    meta-llama/Llama-3.2-1B-Instruct \
+    NVFP4_DEFAULT_CFG
+```
+
+### Export for Deployment
+
+Export the quantized checkpoint to a TensorRT-LLM, vLLM, or SGLang-compatible unified checkpoint:
+
+```bash
+PP=1 \
+HF_MODEL_CKPT=/path/to/Llama-3.2-1B-Instruct \
+MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+./examples/post_training/modelopt/export.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+### Supported Quantization Formats
+
+| Format | Config Name | Notes |
+|---|---|---|
+| NVFP4 | `NVFP4_DEFAULT_CFG` | 4-bit NVIDIA format; requires Blackwell GPUs for real compute |
+| FP8 | `FP8_DEFAULT_CFG` | 8-bit floating point; Hopper/Ada/Blackwell GPUs |
+| FP8 blockwise | `FP8_BLOCKWISE_DEFAULT_CFG` | Finer-grained FP8 scaling |
+| INT8 SmoothQuant | `INT8_SMOOTHQUANT_CFG` | 8-bit integer with activation scaling |
+| INT4 AWQ | `INT4_AWQ_CFG` | 4-bit with activation-aware weight quantization |
+| W4A8 AWQ | `W4A8_AWQ_BETA_CFG` | 4-bit weights, 8-bit activations |
+
+KV cache quantization is also supported:
+
+```bash
+# Add KV cache quantization to export
+MLM_EXTRA_ARGS="--export-kv-cache-quant fp8" \
+./examples/post_training/modelopt/export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+### Evaluation
+
+After quantization, evaluate the model on MMLU:
+
+```bash
+TP=1 \
+MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+./examples/post_training/modelopt/mmlu.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+---
+
+## Pruning
+
+ModelOpt supports structured pruning of Megatron-LM GPT and Mamba models in Pipeline Parallel mode. Pruning removes redundant neurons, attention heads, FFN dimensions, or entire layers, producing a smaller architecture that can then be fine-tuned.
+
+### Prunable Dimensions
+
+| Target | Argument |
+|---|---|
+| FFN hidden size | `TARGET_FFN_HIDDEN_SIZE` |
+| Hidden size | `TARGET_HIDDEN_SIZE` |
+| Attention heads | `TARGET_NUM_ATTENTION_HEADS` |
+| Query groups (GQA) | `TARGET_NUM_QUERY_GROUPS` |
+| Number of layers (depth) | `TARGET_NUM_LAYERS` |
+| Specific layers to drop | `LAYERS_TO_DROP` (comma-separated, 1-indexed) |
+| MoE experts | `TARGET_NUM_MOE_EXPERTS` |
+| MoE FFN hidden size | `TARGET_MOE_FFN_HIDDEN_SIZE` |
+
+### Depth Pruning Example
+
+Prune Qwen3-8B from 36 layers to 24 layers:
+
+```bash
+PP=1 \
+TARGET_NUM_LAYERS=24 \
+HF_MODEL_CKPT=/path/to/Qwen3-8B \
+MLM_MODEL_SAVE=Qwen3-8B-Pruned \
+./examples/post_training/modelopt/prune.sh \
+    Qwen/Qwen3-8B
+```
+
+After pruning, the saved checkpoint stores the new smaller architecture and can be loaded directly for fine-tuning or inference. When loading a pruned checkpoint for subsequent steps, pass the pruned architecture parameters explicitly:
+
+```bash
+MLM_EXTRA_ARGS="--num-layers 24" \
+./examples/post_training/modelopt/mmlu.sh \
+    Qwen/Qwen3-8B
+```
+
+<Tip>
+  Reuse pruning scores to prune the same model to multiple target sizes without re-running the calibration step: `PRUNE_ARGS="--pruning-scores-path /path/to/scores"`.
+</Tip>
+
+---
+
+## Knowledge Distillation
+
+ModelOpt supports knowledge distillation from a large teacher model into a smaller student model. This is useful for compressing models while preserving most of their task performance.
+
+### Standard Distillation
+
+```bash
+TP=1 \
+HF_MODEL_CKPT=/path/to/student_model \
+MLM_MODEL_SAVE=/tmp/student_distilled \
+./examples/post_training/modelopt/finetune.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+Configure the teacher checkpoint and distillation settings via ModelOpt arguments:
+
+| Argument | Description |
+|---|---|
+| `--export-kd-teacher-load` | Path to teacher model checkpoint |
+| `--export-kd-teacher-model-config` | Path to teacher model config YAML |
+| `--export-kd-teacher-ckpt-format` | Teacher checkpoint format: `torch`, `torch_dist`, `torch_dcp` |
+| `--export-kd-cfg` | Path to distillation configuration YAML for custom settings |
+
+### EAGLE3 Speculative Decoding
+
+EAGLE3 trains a draft model for speculative decoding. Two workflows are supported:
+
+**Online EAGLE3** (target and draft model both in memory; acceptance length evaluated during training):
+
+```bash
+TP=1 \
+HF_MODEL_CKPT=/path/to/Llama-3.2-1B-Instruct \
+MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
+./examples/post_training/modelopt/eagle3.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+**Offline EAGLE3** (precompute target model hidden states to disk, then train draft model separately):
+
+```bash
+# 1. Convert to EAGLE3 model for feature extraction
+HF_MODEL_CKPT=/path/to/Llama-3.2-1B-Instruct \
+MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
+MLM_EXTRA_ARGS="--algorithm eagle3" \
+./examples/post_training/modelopt/convert.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+
+# 2. Dump hidden states to disk
+MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3 \
+MLM_EXTRA_ARGS="--output-dir /tmp/offline_data" \
+./examples/post_training/modelopt/offline_feature_extract.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+
+# 3. Train the draft model using cached features
+MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
+MLM_EXTRA_ARGS="--export-offline-model --offline-distillation-data /tmp/offline_data" \
+./examples/post_training/modelopt/finetune.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+
+# 4. Export the trained EAGLE3 checkpoint
+PP=1 \
+HF_MODEL_CKPT=/path/to/Llama-3.2-1B-Instruct \
+MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Eagle3-offline \
+EXPORT_DIR=/tmp/Llama-3.2-1B-Eagle3-Export \
+MLM_EXTRA_ARGS="--export-offline-model" \
+./examples/post_training/modelopt/export.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+---
+
+## Supervised Fine-Tuning
+
+ModelOpt supports supervised fine-tuning (SFT) and parameter-efficient fine-tuning (PEFT) starting from any Megatron-LM checkpoint:
+
+```bash
+TP=1 \
+MLM_MODEL_CKPT=/path/to/checkpoint \
+./examples/post_training/modelopt/finetune.sh \
+    meta-llama/Llama-3.2-1B-Instruct
+```
+
+Fine-tuning arguments:
+
+| Argument | Description |
+|---|---|
+| `--finetune-hf-dataset` | HuggingFace dataset name for SFT |
+| `--finetune-data-split` | Dataset split to use (default: `train`) |
+
+<Info>
+  All ModelOpt post-training workflows produce Megatron-LM distributed checkpoints in `torch_dist` format. These checkpoints can be resumed for additional training, evaluated, or exported to deployment formats using the same scripts.
+</Info>
+
+## Examples Directory
+
+Full working scripts and configuration files are in `examples/post_training/modelopt/`:
+
+| File | Purpose |
+|---|---|
+| `quantize.sh` / `quantize.py` | Post-training quantization |
+| `prune.sh` / `prune.py` | Structured pruning |
+| `finetune.sh` / `finetune.py` | SFT and distillation training |
+| `export.sh` / `export.py` | Export to TensorRT-LLM / vLLM / SGLang |
+| `generate.sh` / `generate.py` | Text generation from saved checkpoint |
+| `mmlu.sh` / `mmlu.py` | MMLU benchmark evaluation |
+| `eagle3.sh` | Online EAGLE3 speculative decoding training |
+| `conf/` | Per-model configuration YAML files |
+| `ADVANCED.md` | Slurm examples, advanced configuration |
+| `distillation.md` | Knowledge distillation guide |
+| `speculative.md` | Speculative decoding guide |

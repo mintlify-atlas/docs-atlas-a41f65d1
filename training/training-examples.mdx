@@ -1,0 +1,385 @@
+---
+title: "Training Examples"
+description: "Practical examples for pretraining GPT, LLaMA-3, BERT, and other model architectures with Megatron-LM."
+---
+
+Megatron-LM supports pretraining a wide range of model architectures. All models are launched via `torchrun` (or equivalent) and accept a common set of arguments for parallelism, data, and optimization. This page covers the most common training configurations with working example scripts.
+
+## Quick Start
+
+The fastest way to verify your installation is the simple training loop example, which runs on mock data and requires no data preprocessing:
+
+```bash
+# Distributed training on 2 GPUs with mock data
+torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
+```
+
+This runs a minimal GPT training loop with generated data — no tokenizer or dataset files needed. Use this to confirm your NCCL, CUDA, and Megatron-Core setup before preparing real datasets.
+
+## Multi-GPU and Multi-Node Launch
+
+All Megatron-LM training scripts use `torchrun` for distributed launch.
+
+**Single node, 8 GPUs:**
+
+```bash
+torchrun \
+    --nproc_per_node 8 \
+    --nnodes 1 \
+    pretrain_gpt.py \
+    [model and training args...]
+```
+
+**Multi-node (e.g., 2 nodes × 8 GPUs = 16 GPUs total):**
+
+```bash
+# Run this on each node; NODE_RANK differs per node (0 on primary, 1 on secondary, etc.)
+torchrun \
+    --nproc_per_node 8 \
+    --nnodes 2 \
+    --node_rank $NODE_RANK \
+    --master_addr $MASTER_ADDR \
+    --master_port 6000 \
+    pretrain_gpt.py \
+    [model and training args...]
+```
+
+<Tip>
+  Set `export CUDA_DEVICE_MAX_CONNECTIONS=1` before launching for better GPU communication overlap, especially with tensor parallelism.
+</Tip>
+
+## Model Examples
+
+<Tabs>
+  <Tab title="LLaMA-3 8B">
+    LLaMA-3 training uses `pretrain_gpt.py` with architecture flags matching the LLaMA-3 design: RoPE positional embeddings, RMSNorm, SwiGLU activation, Grouped Query Attention (GQA), and no bias terms in linear layers.
+
+    <Note>
+      FP8 training requires an NVIDIA Hopper (H100), Ada Lovelace, or Blackwell GPU. The Transformer Engine library must be installed. For non-FP8 training, replace `--fp8-format hybrid` with `--bf16`.
+    </Note>
+
+    **Run the prebuilt script (mock data, 8 GPUs, H100):**
+
+    ```bash
+    bash examples/llama/train_llama3_8b_h100_fp8.sh \
+        /path/to/checkpoints \
+        /path/to/tensorboard_logs
+    ```
+
+    **Run with real data and tokenizer:**
+
+    ```bash
+    bash examples/llama/train_llama3_8b_h100_fp8.sh \
+        /path/to/checkpoints \
+        /path/to/tensorboard_logs \
+        /path/to/tokenizer.model \
+        /path/to/preprocessed_data_prefix
+    ```
+
+    **Full launch command with key flags:**
+
+    ```bash
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+    torchrun \
+        --nproc_per_node 8 \
+        --nnodes 1 \
+        --master_addr localhost \
+        --master_port 6000 \
+        pretrain_gpt.py \
+        --use-mcore-models \
+        --num-layers 32 \
+        --hidden-size 4096 \
+        --ffn-hidden-size 14336 \
+        --num-attention-heads 32 \
+        --group-query-attention \
+        --num-query-groups 8 \
+        --kv-channels 128 \
+        --seq-length 8192 \
+        --max-position-embeddings 8192 \
+        --position-embedding-type rope \
+        --rotary-base 1000000 \
+        --swiglu \
+        --normalization RMSNorm \
+        --untie-embeddings-and-output-weights \
+        --disable-bias-linear \
+        --attention-backend fused \
+        --tensor-model-parallel-size 1 \
+        --context-parallel-size 2 \
+        --micro-batch-size 1 \
+        --global-batch-size 128 \
+        --train-samples 1953125000 \
+        --lr 0.00015 \
+        --min-lr 0.00001 \
+        --lr-decay-style cosine \
+        --weight-decay 0.1 \
+        --clip-grad 1.0 \
+        --bf16 \
+        --fp8-format hybrid \
+        --fp8-amax-history-len 1024 \
+        --fp8-amax-compute-algo max \
+        --use-distributed-optimizer \
+        --overlap-grad-reduce \
+        --overlap-param-gather \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --data-path /path/to/preprocessed_data \
+        --split 99,1,0 \
+        --save /path/to/checkpoints \
+        --load /path/to/checkpoints \
+        --save-interval 1000 \
+        --eval-interval 100 \
+        --eval-iters 32 \
+        --log-interval 1 \
+        --ckpt-format torch_dist \
+        --tensorboard-dir /path/to/tensorboard_logs
+    ```
+
+    **Tested FP8 performance benchmarks:**
+
+    | Model | GPUs | Global BS | Seq Len | TP | PP | CP | Tokens/s/GPU | TFLOP/s/GPU |
+    |---|---|---|---|---|---|---|---|---|
+    | LLaMA3-8B | 8 | 128 | 8192 | 1 | 1 | 2 | 13,812 | 800 |
+    | LLaMA3-70B | 64 | 128 | 8192 | 4 | 8 | 1 | 1,621 | 780 |
+    | LLaMA3-405B | 1024 | 512 | 8192 | 8 | 8 | 2 | 315 | 834 |
+  </Tab>
+
+  <Tab title="GPT-3 175B">
+    The `examples/gpt3/` directory contains a reference script for training a 175B parameter GPT-3 model. This requires significant infrastructure: the default configuration uses tensor parallelism of 8 and pipeline parallelism of 16, requiring at least 128 GPUs.
+
+    <Note>
+      GPT-3 175B requires at minimum 128 A100 or H100 GPUs with high-bandwidth interconnects (NVLink + InfiniBand). For smaller GPUs or clusters, adjust `--tensor-model-parallel-size` and `--pipeline-model-parallel-size` accordingly.
+    </Note>
+
+    ```bash
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+    CHECKPOINT_PATH=/path/to/checkpoints
+    TENSORBOARD_LOGS_PATH=/path/to/tensorboard_logs
+    VOCAB_FILE=/path/to/gpt2-vocab.json
+    MERGE_FILE=/path/to/gpt2-merges.txt
+    DATA_PATH=/path/to/preprocessed_data_text_document
+
+    torchrun \
+        --nproc_per_node 8 \
+        --nnodes 16 \
+        --node_rank $NODE_RANK \
+        --master_addr $MASTER_ADDR \
+        --master_port 6000 \
+        pretrain_gpt.py \
+        --num-layers 96 \
+        --hidden-size 12288 \
+        --num-attention-heads 96 \
+        --seq-length 2048 \
+        --max-position-embeddings 2048 \
+        --attention-backend auto \
+        --tensor-model-parallel-size 8 \
+        --pipeline-model-parallel-size 16 \
+        --micro-batch-size 1 \
+        --global-batch-size 1536 \
+        --rampup-batch-size 16 16 5859375 \
+        --train-iters 500000 \
+        --lr 6.0e-5 \
+        --min-lr 6.0e-6 \
+        --lr-decay-style cosine \
+        --lr-warmup-fraction 0.001 \
+        --lr-decay-iters 430000 \
+        --weight-decay 0.1 \
+        --adam-beta1 0.9 \
+        --adam-beta2 0.95 \
+        --clip-grad 1.0 \
+        --fp16 \
+        --data-path $DATA_PATH \
+        --vocab-file $VOCAB_FILE \
+        --merge-file $MERGE_FILE \
+        --split 949,50,1 \
+        --save $CHECKPOINT_PATH \
+        --load $CHECKPOINT_PATH \
+        --save-interval 10000 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
+        --log-interval 100 \
+        --tensorboard-dir $TENSORBOARD_LOGS_PATH
+    ```
+
+    **Smaller GPT configurations:**
+
+    | Variant | `--num-layers` | `--hidden-size` | `--num-attention-heads` | `--seq-length` | TP | PP |
+    |---|---|---|---|---|---|---|
+    | 345M | 12 | 512 | 8 | 1024 | 1 | 1 |
+    | 857M | 24 | 1024 | 16 | 2048 | 1 | 1 |
+    | 175B | 96 | 12288 | 96 | 2048 | 8 | 16 |
+  </Tab>
+
+  <Tab title="BERT 340M">
+    BERT pretraining uses `pretrain_bert.py`. The reference script trains BERT-Large (340M parameters) with masked language modeling. BERT tokenization should use `--split-sentences` during data preprocessing.
+
+    <Note>
+      The 340M BERT-Large reference configuration uses tensor parallelism of 8 and pipeline parallelism of 16, totaling 128 GPUs. For single-node runs, reduce both to 1 and adjust batch sizes.
+    </Note>
+
+    ```bash
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+    CHECKPOINT_PATH=/path/to/checkpoints
+    TENSORBOARD_LOGS_PATH=/path/to/tensorboard_logs
+    VOCAB_FILE=/path/to/bert-vocab.txt
+    DATA_PATH=/path/to/preprocessed_data_text_document
+
+    torchrun \
+        --nproc_per_node 8 \
+        --nnodes 16 \
+        --node_rank $NODE_RANK \
+        --master_addr $MASTER_ADDR \
+        --master_port 6000 \
+        pretrain_bert.py \
+        --num-layers 24 \
+        --hidden-size 1024 \
+        --num-attention-heads 16 \
+        --seq-length 512 \
+        --max-position-embeddings 512 \
+        --attention-backend auto \
+        --tensor-model-parallel-size 8 \
+        --pipeline-model-parallel-size 16 \
+        --micro-batch-size 4 \
+        --global-batch-size 32 \
+        --train-iters 1000000 \
+        --lr 0.0001 \
+        --min-lr 1.0e-5 \
+        --lr-decay-style linear \
+        --lr-decay-iters 990000 \
+        --lr-warmup-fraction 0.01 \
+        --weight-decay 1e-2 \
+        --clip-grad 1.0 \
+        --fp16 \
+        --data-path $DATA_PATH \
+        --vocab-file $VOCAB_FILE \
+        --split 949,50,1 \
+        --save $CHECKPOINT_PATH \
+        --load $CHECKPOINT_PATH \
+        --save-interval 10000 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
+        --log-interval 100 \
+        --tensorboard-dir $TENSORBOARD_LOGS_PATH
+    ```
+
+    **Other BERT configurations:**
+
+    | Variant | `--num-layers` | `--hidden-size` | `--num-attention-heads` | TP | PP |
+    |---|---|---|---|---|---|
+    | 340M (Large) | 24 | 1024 | 16 | 8 | 16 |
+    | 4B | 48 | 2560 | 32 | 1 | 1 |
+    | 20B | 48 | 6144 | 96 | 4 | 4 |
+  </Tab>
+
+  <Tab title="GPT (custom)">
+    For custom GPT training with your own data and hyperparameters, use `pretrain_gpt.py` directly. This example configures a mid-sized GPT model on 8 GPUs using BF16:
+
+    ```bash
+    torchrun \
+        --nproc_per_node 8 \
+        pretrain_gpt.py \
+        --use-mcore-models \
+        --tensor-model-parallel-size 1 \
+        --pipeline-model-parallel-size 1 \
+        --num-layers 32 \
+        --hidden-size 4096 \
+        --num-attention-heads 32 \
+        --seq-length 2048 \
+        --max-position-embeddings 2048 \
+        --micro-batch-size 4 \
+        --global-batch-size 32 \
+        --train-iters 100000 \
+        --lr 3.0e-4 \
+        --min-lr 3.0e-5 \
+        --lr-decay-style cosine \
+        --lr-warmup-iters 2000 \
+        --weight-decay 0.1 \
+        --clip-grad 1.0 \
+        --bf16 \
+        --tokenizer-type HuggingFaceTokenizer \
+        --tokenizer-model /path/to/tokenizer.model \
+        --data-path /path/to/preprocessed_data \
+        --split 949,50,1 \
+        --save /path/to/checkpoints \
+        --load /path/to/checkpoints \
+        --save-interval 1000 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
+        --log-interval 10
+    ```
+  </Tab>
+</Tabs>
+
+## Key Training Arguments
+
+### Model Architecture
+
+| Argument | Description |
+|---|---|
+| `--use-mcore-models` | Use Megatron-Core model implementations (recommended) |
+| `--num-layers` | Number of transformer layers |
+| `--hidden-size` | Hidden dimension size |
+| `--num-attention-heads` | Number of attention heads |
+| `--ffn-hidden-size` | FFN intermediate dimension (defaults to `4 × hidden-size`) |
+| `--seq-length` | Training sequence length |
+| `--max-position-embeddings` | Maximum position embedding length |
+| `--position-embedding-type` | `learned_absolute` (default), `rope`, `alibi`, `kerple_log`, `none` |
+| `--group-query-attention` | Enable Grouped Query Attention (GQA) |
+| `--num-query-groups` | Number of query groups for GQA |
+| `--swiglu` | Use SwiGLU activation (LLaMA-style) |
+| `--normalization` | Layer normalization type: `LayerNorm` or `RMSNorm` |
+| `--disable-bias-linear` | Remove bias from linear layers |
+| `--untie-embeddings-and-output-weights` | Use separate input/output embedding matrices |
+
+### Parallelism
+
+| Argument | Description |
+|---|---|
+| `--tensor-model-parallel-size` | Tensor parallelism degree (splits each layer across GPUs) |
+| `--pipeline-model-parallel-size` | Pipeline parallelism degree (splits layers across GPUs) |
+| `--context-parallel-size` | Context parallelism degree (splits sequence dimension) |
+| `--sequence-parallel` | Enable sequence parallelism (recommended with tensor parallelism) |
+
+### Training Configuration
+
+| Argument | Description |
+|---|---|
+| `--micro-batch-size` | Per-GPU batch size |
+| `--global-batch-size` | Total effective batch size across all GPUs |
+| `--train-iters` | Number of training iterations |
+| `--train-samples` | Alternative to `--train-iters`: total training tokens ÷ sequence length |
+| `--rampup-batch-size` | Gradually ramp global batch size: `start end ramp_samples` |
+
+### Learning Rate
+
+| Argument | Description |
+|---|---|
+| `--lr` | Peak learning rate |
+| `--min-lr` | Minimum learning rate at end of decay |
+| `--lr-decay-style` | Schedule: `cosine`, `linear`, `constant` |
+| `--lr-warmup-iters` | Linear warmup steps |
+| `--lr-warmup-fraction` | Warmup as a fraction of total training steps |
+| `--lr-decay-iters` | Explicit decay steps (defaults to `--train-iters`) |
+
+### Mixed Precision
+
+| Argument | Description |
+|---|---|
+| `--fp16` | FP16 mixed precision training |
+| `--bf16` | BF16 mixed precision training (recommended for Ampere+) |
+| `--fp8-format hybrid` | FP8 mixed precision with hybrid format (Hopper/Ada/Blackwell only) |
+| `--fp8-amax-history-len` | History length for FP8 amax computation (default: `1024`) |
+| `--fp8-amax-compute-algo` | Algorithm for amax: `max` or `most_recent` |
+
+### Data and Logging
+
+| Argument | Description |
+|---|---|
+| `--data-path` | Path prefix to preprocessed binary dataset (without `.bin`/`.idx`) |
+| `--split` | Train/validation/test split percentages (e.g., `949,50,1`) |
+| `--log-interval` | Logging frequency in iterations |
+| `--eval-interval` | Evaluation frequency in iterations |
+| `--eval-iters` | Number of iterations per evaluation |
+| `--tensorboard-dir` | Directory for TensorBoard logs |
